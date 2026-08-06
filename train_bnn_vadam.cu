@@ -138,14 +138,25 @@ int main(int argc, char **argv) {
            prop.totalGlobalMem / 1e9);
     CUBLAS_CHECK(cublasCreate(&cublas_handle));
 
-    Config cfg = { .B = 4, .T = 64, .C = 768, .V = VOCAB, .NH = 12, .maxT = 1024, .L = NBLOCKS };
+    Config cfg = { .B = 4, .T = 64, .C = 384, .V = VOCAB, .NH = 6, .maxT = 1024, .L = NBLOCKS };
     ParamOff p = param_offsets(cfg);
     ActOff   a = act_offsets(cfg);
     size_t n = p.total;
     int BT = cfg.B * cfg.T;
 
     // ---- the algorithm's inputs -------------------------------------------
-    const float LAMBDA = 100.0f;   // prior precision; sigma_prior = 1/sqrt = 0.1
+    // Vadam has no KL weight — the prior lives inside sigma = 1/sqrt(N*s+lambda),
+    // so LAMBDA is where the same "stale prior scale" mistake shows up. It was
+    // 100 (sigma_prior = 0.1), which is FIVE TIMES the scale the weights are
+    // initialized at (0.02). That injects 500% relative noise and is why this
+    // arm diverged on char-level data.
+    //
+    // Derived instead: the prior std should match the scale the weights live
+    // at, so lambda = 1/init_std^2. At init_std = 0.02 that is 2500, giving a
+    // step-1 sigma of exactly 0.02.
+    const float MU_INIT_STD = 0.02f;
+    float LAMBDA = 1.0f / (MU_INIT_STD * MU_INIT_STD);   // = 2500
+    if (argc > 3) LAMBDA = (float)atof(argv[3]);         // explicit sweep value
     const float S0     = 0.0f;     // s init; 0 -> step-1 sigma is exactly the prior
     const float LR = overfit ? 1e-3f : 1e-4f;   // same lr policy as the BBB file
     const float G1 = 0.9f, G2 = 0.999f;
@@ -283,6 +294,10 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (!overfit) {
+        ckpt_save("vadam", "mu", d_mu, n, cfg, STEPS);
+        ckpt_save("vadam", "s",  d_s,  n, cfg, STEPS);   // sigma is derived from s
+    }
     printf("\ndone.\n");
     free(h_inp); free(h_tgt); free(h_losses); free(h_klp); free(h_sigp); free(h_smin); free(h_smax);
     free(ld.tokens);

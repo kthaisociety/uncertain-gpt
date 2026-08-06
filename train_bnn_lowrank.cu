@@ -321,7 +321,7 @@ int main(int argc, char **argv) {
            prop.minor, prop.totalGlobalMem / 1e9, RANK);
     CUBLAS_CHECK(cublasCreate(&cublas_handle));
 
-    Config cfg = { .B = 4, .T = 64, .C = 768, .V = VOCAB, .NH = 12, .maxT = 1024, .L = NBLOCKS };
+    Config cfg = { .B = 4, .T = 64, .C = 384, .V = VOCAB, .NH = 6, .maxT = 1024, .L = NBLOCKS };
     ParamOff po = param_offsets(cfg);
     ActOff   a  = act_offsets(cfg);
     size_t n = po.total;
@@ -343,7 +343,10 @@ int main(int argc, char **argv) {
     }
 
     const float LAMBDA = 100.0f;                 // prior precision, sigma_p = 0.1
-    const float KLW    = overfit ? 0.0f : 1e-3f; // same policy as BBB
+    // DERIVED from the dataset once the loader is up — see train_bnn_gpu.cu's
+    // header. The ELBO is E_q[NLL] + KL/N; hardcoding this cost 1.0 nats there
+    // and this file inherited the same stale 1e-3.
+    float KLW = 0.0f;
     const float LR = overfit ? 1e-3f : 1e-4f;
     // SEPARATE lr for the variance group (A and rhod). AdamW's step is
     // scale-free — about `lr` regardless of gradient size — so one lr cannot
@@ -588,6 +591,8 @@ int main(int argc, char **argv) {
     float *h_losses = (float *)malloc(BT * sizeof(float));
     Loader ld;
     loader_init(&ld, DATA_TRAIN);
+    if (!overfit) KLW = 1.0f / (float)ld.n;      // ELBO: KL is per-dataset
+    if (argc > 3) KLW = (float)atof(argv[3]);    // explicit sweep value
     printf("\n%s: %d steps, lambda %.0f, kl_weight %.0e\n\n",
            overfit ? "OVERFIT MODE" : "TRAINING", STEPS, LAMBDA, KLW);
     if (overfit) {
@@ -694,6 +699,11 @@ int main(int argc, char **argv) {
            RANK, Pb, 100.0 * Pb / n);
     printf("summary: A = %.0f MB; low-rank costs MORE than mean-field, the case is quality\n",
            ab / 1e6);
+    if (!overfit) {
+        ckpt_save("lowr", "theta", d_theta, n,        cfg, STEPS);
+        ckpt_save("lowr", "A",     d_A,     Pb*RANK,  cfg, STEPS);
+        ckpt_save("lowr", "rhod",  d_rhod,  Pb,       cfg, STEPS);
+    }
     printf("\ndone.\n");
     return 0;
 }

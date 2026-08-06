@@ -35,6 +35,37 @@
  idea: eps is regenerated with Philox rather than stored, which removes a
  340 MB buffer and ~680 MB/step of traffic. Kept because it changes no math
  whatsoever — the overfit test reaches the same loss either way.
+
+-----------------------------------------------------------------------------
+ THE KL WEIGHT IS DERIVED, NOT TUNED.  (recorded because getting this wrong
+ cost 1.0 nats and briefly made Bayesian methods look categorically worse
+ than they are)
+
+ The ELBO is
+
+     loss = E_q[NLL]  +  KL(q || p) / N
+
+ The 1/N is not a knob. It falls out of the KL being a per-DATASET quantity
+ while the reported NLL is a per-TOKEN mean. N = the training token count, so
+ KLW = 1/ld.n, computed from the loader.
+
+ Measured on 6 blocks, char-level TinyShakespeare, 2000 steps:
+
+     KLW = 1e-3  (hardcoded, stale)   nll 3.4328
+     KLW = 1e-4                       nll 2.7034
+     KLW = 1e-6  (= 1/N, correct)     nll 2.4389
+     KLW = 0                          nll 2.4068
+     deterministic single model       nll 2.3167
+
+ At the correct weight the cost of being Bayesian is 0.12 nats. At the stale
+ one it looked like 1.1. The value had been carried over from an earlier
+ experiment with a different dataset and parameter count and never re-derived
+ — which is exactly why it is now computed rather than typed.
+
+ This is bottleneck E ("KL weight sensitivity") from the project taxonomy,
+ measured: three orders of magnitude in one constant move the loss by a full
+ nat. Worth reporting, since BNN papers commonly quote a tuned KL weight
+ without deriving it.
 =============================================================================
 */
 
@@ -128,7 +159,7 @@ int main(int argc, char **argv) {
            prop.totalGlobalMem / 1e9);
     CUBLAS_CHECK(cublasCreate(&cublas_handle));
 
-    Config cfg = { .B = 4, .T = 64, .C = 768, .V = VOCAB, .NH = 12, .maxT = 1024, .L = NBLOCKS };
+    Config cfg = { .B = 4, .T = 64, .C = 384, .V = VOCAB, .NH = 6, .maxT = 1024, .L = NBLOCKS };
     if (cfg.C / cfg.NH != HS) { printf("HS must equal C/NH\n"); return 1; }
 
     ParamOff p = param_offsets(cfg);
@@ -137,7 +168,12 @@ int main(int argc, char **argv) {
     int BT = cfg.B * cfg.T;
 
     const float SP = 0.1f;                  // prior sigma
-    const float KLW = overfit ? 0.0f : 1e-3f;
+    // KLW is DERIVED from the dataset size once the loader is up (see below).
+    // It is NOT a free knob: the ELBO is  E_q[NLL] + KL/N,  and that 1/N falls
+    // out of the KL being a per-DATASET quantity while the reported NLL is a
+    // per-TOKEN mean. See the header for what hardcoding it cost.
+    float KLW = 0.0f;
+    const bool klw_override = (argc > 3);   // explicit sweep value, if given
     // Overfit mode wants a big lr on purpose: the test is "can 256 tokens be
     // memorized at all", and at 1e-4 it only gets to nll 7.6 in 200 steps —
     // which proves the gradients point downhill but not that the chain is
@@ -205,6 +241,11 @@ int main(int argc, char **argv) {
 
     Loader ld;
     loader_init(&ld, DATA_TRAIN);
+
+    // ---- the ELBO's KL weight, derived --------------------------------------
+    if (!overfit) KLW = 1.0f / (float)ld.n;
+    if (klw_override) KLW = (float)atof(argv[3]);
+
     if (overfit) {
         // One batch, reused forever. If the model cannot memorize 256 tokens,
         // something is wired wrong — this catches what a gradient check cannot:
@@ -285,6 +326,10 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (!overfit) {
+        ckpt_save("bbb", "mu",  d_mu,  n, cfg, STEPS);
+        ckpt_save("bbb", "rho", d_rho, n, cfg, STEPS);
+    }
     printf("\ndone.\n");
     free(h_inp); free(h_tgt); free(h_losses); free(h_klp); free(h_sigp); free(h_smin); free(h_smax);
     free(ld.tokens);

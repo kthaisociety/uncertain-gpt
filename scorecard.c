@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
 
 typedef struct {
     const char *name;    // variant
@@ -44,26 +45,35 @@ typedef struct {
 } Run;
 
 static Run RUNS[] = {
-    { "BBB",   "overfit", "./train_bnn_gpu overfit" },
-    { "BBB",   "train",   "./train_bnn_gpu" },
-    { "Vadam", "overfit", "./train_bnn_vadam overfit" },
-    { "Vadam", "train",   "./train_bnn_vadam" },
-    { "Ens5",  "overfit", "./train_ensemble overfit" },
-    { "Ens5",  "train",   "./train_ensemble" },
-    { "LowR8", "overfit", "./train_bnn_lowrank overfit" },
-    { "LowR8", "train",   "./train_bnn_lowrank" },
+    { "BBB",   "overfit", "./train_bnn_gpu overfit 200" },
+    { "BBB",   "train",   "./train_bnn_gpu train 100000" },
+    { "Vadam", "overfit", "./train_bnn_vadam overfit 200" },
+    { "Vadam", "train",   "./train_bnn_vadam train 100000" },
+    { "Ens5",  "overfit", "./train_ensemble overfit 200" },
+    { "Ens5",  "train",   "./train_ensemble train 100000" },
+    { "LowR4", "overfit", "./train_bnn_lowrank overfit 200" },
+    { "LowR4", "train",   "./train_bnn_lowrank train 100000" },
 };
 static const int NRUNS = sizeof(RUNS) / sizeof(RUNS[0]);
 
 static void execute(Run *r) {
     printf("running: %-28s ... ", r->cmd);
     fflush(stdout);
+
+    // Every run's FULL stdout is kept. A 4-hour run must never have to be
+    // repeated because a number was not printed into the summary table.
+    mkdir("runs", 0755);
+    char logpath[256];
+    snprintf(logpath, sizeof logpath, "runs/%s_%s.log", r->name, r->mode);
+    FILE *lg = fopen(logpath, "w");
+
     FILE *p = popen(r->cmd, "r");
-    if (!p) { printf("FAILED TO LAUNCH\n"); return; }
+    if (!p) { printf("FAILED TO LAUNCH\n"); if (lg) fclose(lg); return; }
 
     char line[512];
     int first = 1;
     while (fgets(line, sizeof(line), p)) {
+        if (lg) fputs(line, lg);
         float v;
         if (sscanf(line, "total VRAM ~%f", &v) == 1) r->vram = v;
 
@@ -85,13 +95,32 @@ static void execute(Run *r) {
         }
     }
     int rc = pclose(p);
+    if (lg) fclose(lg);
     r->ran = (rc == 0 && r->steps > 0);
     if (!r->ran) { printf("FAILED (exit %d)\n", rc); return; }
 
     // the gate
     if (strcmp(r->mode, "overfit") == 0) r->ok = (r->nll1 < 0.05f);
     else                                 r->ok = (r->nll1 < r->nll0);
-    printf("done (%d steps)\n", r->steps);
+
+    // APPEND, never overwrite: results accumulate across sessions so old
+    // configurations stay comparable to new ones.
+    FILE *csv = fopen("runs/results.csv", "a");
+    if (csv) {
+        fseek(csv, 0, SEEK_END);
+        if (ftell(csv) == 0)
+            fprintf(csv, "utc,arm,mode,cmd,steps,ms_per_step,vram_gb,"
+                         "nll_first,nll_last,sigma_mean,sigma_min,sigma_max,gate\n");
+        time_t t = time(NULL); char ts[32];
+        strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%S", gmtime(&t));
+        fprintf(csv, "%s,%s,%s,\"%s\",%d,%.3f,%.3f,%.4f,%.4f,%.6f,%.6f,%.6f,%s\n",
+                ts, r->name, r->mode, r->cmd, r->steps,
+                r->ms_cnt ? r->ms_sum / r->ms_cnt : 0.0, r->vram,
+                r->nll0, r->nll1, r->sig_mean, r->sig_lo, r->sig_hi,
+                r->ok ? "PASS" : "FAIL");
+        fclose(csv);
+    }
+    printf("done (%d steps) -> %s\n", r->steps, logpath);
 }
 
 int main(void) {

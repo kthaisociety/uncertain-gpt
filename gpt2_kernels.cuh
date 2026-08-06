@@ -52,9 +52,17 @@
  the large-batch scaling experiment affordable. Regenerate the .bin files
  with `python3 data/prepare_char.py`.
 --------------------------------------------------------------------------- */
-#define VOCAB      65
-#define DATA_TRAIN "data/tinyshakespeare/tiny_shakespeare_char_train.bin"
-#define DATA_VAL   "data/tinyshakespeare/tiny_shakespeare_char_val.bin"
+// text8: 90M training tokens, vocab 27. TinyShakespeare had 1.0M tokens
+// against 43M parameters — 43x more parameters than data — and the ELBO's KL
+// term is per-dataset, so the prior outweighed the data ~35:1 even at the
+// correct weight. Measured on Vadam, where N sits inside sigma:
+//     N=1e6  best-informed parameter 35% data-driven
+//     N=1e8  best-informed parameter 98% data-driven
+// text8 is also the standard char-level LM benchmark. Regenerate the .bin
+// files with `python3 data/prepare_text8.py`.
+#define VOCAB      27
+#define DATA_TRAIN "data/text8/text8_train.bin"
+#define DATA_VAL   "data/text8/text8_val.bin"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -859,6 +867,40 @@ static void loader_next(Loader *ld, int *h_inp, int *h_tgt, int BT) {
     memcpy(h_inp, ld->tokens + ld->pos,     BT * sizeof(int));
     memcpy(h_tgt, ld->tokens + ld->pos + 1, BT * sizeof(int));
     ld->pos += BT;
+}
+
+/* ===================================================================== *
+ * RUN PERSISTENCE — so a 4-hour run never has to be repeated.
+ *
+ * Two separate things get saved:
+ *   runs/results.csv   the measured numbers (written by scorecard.c)
+ *   runs/*.bin         the trained parameters, written here
+ *
+ * The checkpoints matter more. The uncertainty evaluation (NLPD, ECE,
+ * epistemic ID/OOD at S samples) is still unwritten for three of four arms.
+ * When it lands, it must run against ALREADY TRAINED models — otherwise
+ * every new metric costs another full training run.
+ *
+ * Format: 8-int header {magic, n_lo, C, L, V, NH, steps, n_hi} then n floats.
+ * ===================================================================== */
+
+static void ckpt_save(const char *arm, const char *what, const float *d_buf,
+                      size_t n, Config cfg, int steps) {
+    if (system("mkdir -p runs") != 0) { /* already exists */ }
+    char path[512];
+    snprintf(path, sizeof path, "runs/%s_C%d_L%d_%dk_%s.bin",
+             arm, cfg.C, cfg.L, steps / 1000, what);
+    float *h = (float *)malloc(n * sizeof(float));
+    if (!h) { printf("ckpt: host alloc failed for %s\n", path); return; }
+    CUDA_CHECK(cudaMemcpy(h, d_buf, n * sizeof(float), cudaMemcpyDeviceToHost));
+    FILE *f = fopen(path, "wb");
+    if (!f) { printf("ckpt: cannot write %s\n", path); free(h); return; }
+    int hdr[8] = { 20240520, (int)(n & 0xffffffffu), cfg.C, cfg.L,
+                   cfg.V, cfg.NH, steps, (int)(n >> 32) };
+    fwrite(hdr, sizeof(int), 8, f);
+    fwrite(h, sizeof(float), n, f);
+    fclose(f); free(h);
+    printf("ckpt: %s  (%zu floats, %.0f MB)\n", path, n, n * 4 / 1e6);
 }
 
 /* ===================================================================== *

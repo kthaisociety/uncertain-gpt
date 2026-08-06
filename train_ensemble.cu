@@ -143,7 +143,7 @@ int main(int argc, char **argv) {
            prop.totalGlobalMem / 1e9);
     CUBLAS_CHECK(cublasCreate(&cublas_handle));
 
-    Config cfg = { .B = 4, .T = 64, .C = 768, .V = VOCAB, .NH = 12, .maxT = 1024, .L = NBLOCKS };
+    Config cfg = { .B = 4, .T = 64, .C = 384, .V = VOCAB, .NH = 6, .maxT = 1024, .L = NBLOCKS };
     ParamOff po = param_offsets(cfg);
     ActOff   a  = act_offsets(cfg);
     size_t n = po.total;
@@ -315,6 +315,11 @@ int main(int argc, char **argv) {
     printf("step %4d | nll %8.4f | kl        0.0 | sigma 0.000000 [0.000000, 0.000000] |    0.00 ms\n",
            STEPS, id_acc.nlpd_ens / np);
 
+    if (!overfit)
+        for (int e = 0; e < E_MEMBERS; e++) {
+            char w[32]; snprintf(w, sizeof w, "member%d", e);
+            ckpt_save("ens", w, d_member[e], n, cfg, STEPS);
+        }
     printf("\ndone.\n");
     for (int e = 0; e < E_MEMBERS; e++) { free(h_probs[e]); cudaFree(d_member[e]); }
     free(pbar); free(h_inp); free(h_tgt); free(h_losses); free(h_par); free(ld.tokens);
