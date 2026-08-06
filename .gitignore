@@ -1,0 +1,20 @@
+# Whitelist, not a blacklist: every build artifact in here is an extensionless
+# binary (train_bnn_gpu, dev/adamw, ...), so a list of names would never stay
+# complete. Ignore everything, then let the authored file types back in.
+*
+!*/
+!.gitignore
+!Makefile
+!LICENSE
+!*.c
+!*.cu
+!*.cuh
+!*.h
+!*.py
+!*.md
+!*.svg
+
+# ...except these, which are downloaded or generated, not authored.
+.venv/
+data/tinyshakespeare/
+__pycache__/

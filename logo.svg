@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 260" width="880" height="260" role="img" aria-label="uncertain-gpt">
+  <title>uncertain-gpt</title>
+
+  <!-- The mark: three draws from the same posterior. None of them is the answer. -->
+  <g transform="translate(40 42)" fill="none" stroke-width="4" stroke-linecap="round">
+    <path d="M0 130 C 30 130, 44 22, 78 22 C 112 22, 126 130, 156 130"
+          stroke="#7C5CFF" opacity="0.22" transform="translate(-5 18) scale(1.05 0.9)"/>
+    <path d="M0 130 C 30 130, 44 22, 78 22 C 112 22, 126 130, 156 130"
+          stroke="#7C5CFF" opacity="0.35" transform="translate(13 -7) scale(0.94 1.06)"/>
+    <path d="M0 130 C 30 130, 44 22, 78 22 C 112 22, 126 130, 156 130"
+          stroke="#7C5CFF" opacity="0.95"/>
+    <!-- the mean, dashed, because it is a guess too -->
+    <path d="M78 22 L78 138" stroke="#7C5CFF" opacity="0.55" stroke-width="3" stroke-dasharray="6 7"/>
+  </g>
+
+  <!-- Wordmark. "uncertain" is sampled; "gpt" is the part we are sure about. -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace"
+     font-size="72" font-weight="700">
+    <text x="238" y="126" fill="#7C5CFF" opacity="0.20" transform="translate(-7 6)">uncertain</text>
+    <text x="238" y="126" fill="#7C5CFF" opacity="0.28" transform="translate(8 -5)">uncertain</text>
+    <text x="238" y="126" fill="#7C5CFF" opacity="0.22" transform="translate(4 11)">uncertain</text>
+    <text x="238" y="126"><tspan fill="#8E8BA8">uncertain</tspan><tspan
+        fill="#8E8BA8" opacity="0.5">-</tspan><tspan fill="#7C5CFF">gpt</tspan></text>
+  </g>
+
+  <!-- The error bar, in case the point was too subtle. It brackets the uncertain part. -->
+  <g stroke="#8E8BA8" stroke-width="3" stroke-linecap="round" opacity="0.6">
+    <path d="M240 172 L 624 172"/>
+    <path d="M240 158 L 240 186"/>
+    <path d="M624 158 L 624 186"/>
+  </g>
+  <text x="644" y="183" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace"
+        font-size="30" fill="#8E8BA8" opacity="0.8">&#177; 1&#963;</text>
+
+  <text x="240" y="228" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace"
+        font-size="24" fill="#8E8BA8" opacity="0.7">a GPT-2 that admits it is guessing</text>
+</svg>
