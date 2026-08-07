@@ -60,5 +60,8 @@ else
 	      $(DOC).toc $(DOC).fdb_latexmk $(DOC).fls $(DOC).pdf
 endif
 
+# tables/generated holds committed measurements now, so this throws away
+# real numbers: `git checkout -- tables/generated` puts them back, and
+# regenerating needs runs/ (see README.md).
 distclean: clean
 	rm -rf tables/generated

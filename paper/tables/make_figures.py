@@ -19,6 +19,11 @@ the section \\input s -- it is either an \\includegraphics of the .pdf, or the
 the paper build on a checkout with no runs/ (CI) without a missing-file
 error and without a hand-drawn stand-in.
 
+Both are COMMITTED, like the tables, so that checkout gets the real figure:
+with no sweep data this script leaves whatever is on disk alone rather than
+replacing a plot with the placeholder. It still deletes a figure whose data
+disappeared while runs/ was there to look at.
+
 THE S=1 INVARIANT: one sample disagrees with nothing, so epistemic at S=1
 must be exactly zero. It is the sanity check of the whole plot. If it is not
 exactly zero this script refuses to plot and exits nonzero, rather than
@@ -186,16 +191,28 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     out_pdf = os.path.join(args.out, "fig-s-convergence.pdf")
+    out_tex = os.path.join(args.out, "fig-s-convergence.tex")
+    rel = lambda p: os.path.relpath(p, root)
     have = bool(points)
+
+    # No sweep logs AT ALL is a checkout with no runs/ (CI): the committed
+    # figure is then the only measurement in existence, so keep it. Logs that
+    # stopped yielding points is data that broke while runs/ was right there,
+    # and a plot must never outlive its data -- that path still deletes.
+    if not have and not sweep_logs and os.path.exists(out_tex):
+        print("make_figures: kept the committed figure -- no sweep logs "
+              "under %s to remake it from" % rel(args.sweep))
+        return 0
+
     note = ("source: %d sweep log(s) under %s, split %s%s"
-            % (len(sweep_logs), args.sweep, args.split,
+            % (len(sweep_logs), rel(args.sweep), args.split,
                "" if ens else "; pinned-arm point NOT measured"))
     if have:
         plot(points, ens, out_pdf, args.split)
     elif os.path.exists(out_pdf):
         os.remove(out_pdf)   # never let a stale figure outlive its data
-    with open(os.path.join(args.out, "fig-s-convergence.tex"), "w") as fh:
-        fh.write(figure_tex(have, note))
+    mt.write_fragment(out_tex, figure_tex(have, note), mt.stamp(root),
+                      measured=have)
 
     for key in SWEEPABLE:
         pts = points.get(key, [])
@@ -228,6 +245,17 @@ def selftest():
     t = figure_tex(False, "none")
     assert mt.NA not in t and r"\todo" in t and "includegraphics" not in t, t
     assert r"\includegraphics" in figure_tex(True, "none")
+    # the figure fragment carries no cells, so it must declare measured=
+    # explicitly: a plot on disk survives a run that had nothing to plot.
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "fig.tex")
+        assert mt.write_fragment(p, figure_tex(True, "a"), mt.STAMP + "x",
+                                 measured=True) == "wrote"
+        assert mt.write_fragment(p, figure_tex(False, "b"), mt.STAMP + "y",
+                                 measured=False) == "kept"
+        with open(p) as fh:
+            assert r"\includegraphics" in fh.read(), "placeholder ate the figure"
     print("selftest: ok")
     return 0
 

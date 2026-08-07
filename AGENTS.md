@@ -137,11 +137,15 @@ cover at all (it is single-block).
 `paper/` — see `paper/README.md` for build, table regeneration, and the
 venue-template swap. One rule holds everywhere: **no number is ever typed
 into the paper.** Cost and quality tables are generated from `runs/` into
-`paper/tables/generated/` (gitignored) and a cell with no measurement
-behind it renders as a loud red `TODO`, never as a plausible value.
-`paper/main.pdf` is tracked and rebuilt by `.github/workflows/paper.yml` so
-GitHub can render it; CI has no `runs/`, so **the committed PDF's tables are
-all `TODO` by design** — trust a local build for numbers.
+`paper/tables/generated/` and a cell with no measurement behind it renders
+as a loud red `TODO`, never as a plausible value. Those generated `.tex`
+fragments and the figure PDF **are committed**, because CI (and any clone)
+has no `runs/` and would otherwise publish a PDF of nothing but `TODO`: a
+generator run with nothing measured now keeps them instead of overwriting
+them, and each carries a `% generated: <commit> on <date>` stamp so a stale
+one is detectable. Change a number by regenerating with `runs/` present —
+never by editing a fragment. `paper/main.pdf` is tracked and rebuilt by
+`.github/workflows/paper.yml` so GitHub can render it.
 
 Two presentation choices there are load-bearing, not cosmetic; `paper/README.md`
 says why. The quality and uncertainty tables carry **one row per (arm, split)

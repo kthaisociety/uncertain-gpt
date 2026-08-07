@@ -7,15 +7,21 @@
 !*.cls
 !*.bst
 
-# ...but never the build output, and never the generated tables. Those are
-# rebuilt by `make`; committing one would let a number outlive the
-# measurement it came from.
-tables/generated/
+# ...but never the build output.
 *.pdf
 # ...except the rendered paper itself, which is committed by the `paper`
-# workflow so GitHub can display it in-browser. Its tables are placeholders;
-# see README.md.
+# workflow so GitHub can display it in-browser.
 !main.pdf
+
+# The generated tables and the generated figure ARE committed, and nothing
+# else in tables/generated/ is. They hold measurements, CI has no runs/ to
+# remake them from, and a PDF whose every cell is a TODO is not a paper. The
+# generators refuse to overwrite them with placeholders, and each carries a
+# `% generated:` stamp saying which commit and day it came from -- that, not
+# absence from git, is how a stale one is caught. See README.md.
+tables/generated/*
+!tables/generated/*.tex
+!tables/generated/fig-s-convergence.pdf
 *.aux
 *.bbl
 *.blg

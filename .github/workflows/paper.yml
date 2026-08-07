@@ -34,9 +34,11 @@ jobs:
             texlive-latex-base texlive-latex-recommended texlive-latex-extra \
             texlive-fonts-recommended texlive-bibtex-extra lmodern latexmk
 
-      # `runs/` is gitignored and absent here, so make_tables.py emits \NA for
-      # every cell and the PDF shows a red TODO. That is the intended CI
-      # result -- a number reaches the PDF only if it was measured.
+      # `runs/` is gitignored and absent here, so the generators have nothing
+      # to measure and keep the committed fragments in paper/tables/generated/
+      # instead of overwriting them with placeholders. The PDF built here
+      # therefore carries the numbers of whichever run last regenerated them;
+      # each fragment states that run's commit and day. See paper/README.md.
       #
       # The Makefile owns the build command; this only calls it. A fixed
       # SOURCE_DATE_EPOCH strips the build timestamp out of the PDF so an
