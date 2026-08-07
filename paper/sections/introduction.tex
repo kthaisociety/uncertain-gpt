@@ -21,4 +21,4 @@ hyperparameters, the same precision. Each arm's source file holds only what it s
 and how it updates it, and the ensemble stores no posterior, so every buffer the other
 three add is attributable to their optimiser. Every region of every step is bracketed
 by CUDA events at the launch sites, so each arm's Bayesian work is timed rather than
-inferred as a difference against a baseline that also differs elsewhere.
+inferred as a difference against a baseline.

@@ -86,8 +86,9 @@ deterministic trainer pays it too, unprefixed = O(B·T). Warm-up is discarded,
 the statistic is a median with p25/p75, and every `bench:` line carries the
 temperature and SM-clock range it was taken at. `make_tables.py` parses
 `bench:` and `bench-region:` into `tab-{posterior,bandwidth,amortization,
-fusion}.tex`, so those formats are pinned like the `step`/`summary:` ones. The
-region lines carry the paper's leading claim, and `tab-bandwidth` converts them
+fusion,crossover}.tex`, so those formats are pinned like the `step`/`summary:`
+ones. The region lines carry the paper's leading claim, and `tab-bandwidth`
+converts them
 with touch counts read off the launch sites (`TOUCHES` in the generator) — the
 one number there that comes from source rather than a log.
 
@@ -230,7 +231,7 @@ one is detectable. Change a number by regenerating with `runs/` present —
 never by editing a fragment. `paper/main.pdf` is tracked and rebuilt by
 `.github/workflows/paper.yml` so GitHub can render it.
 
-Three presentation choices there are load-bearing, not cosmetic;
+Four presentation choices there are load-bearing, not cosmetic;
 `paper/README.md` says why. The quality and uncertainty tables carry **one row
 per (arm, split) and prefer neither** — which split the paper standardises on is
 an open decision, and a table that picks would settle it silently. `tab-ood.tex`
@@ -239,13 +240,22 @@ is a separate table because the OOD stream is a fixed synthetic sequence with
 refuses to state it once if the two splits ever disagree. And the flat posterior
 cost (`tab-posterior`) is stated for the **unfused** variant, because fusing puts
 the Bayesian update in the same kernel as the deterministic one and only total
-O(P) work stays comparable across the two. `tab-cost.tex` is still generated as
-the training-run record but is no longer `\input`: its `ms/step` predates the
-`bench_*` protocol that supersedes it.
+O(P) work stays comparable across the two. Finally `tab-crossover` decides where
+folding stops paying against the **1% band the control arm reproduces itself
+in** (`DRIFT_BAND`), not a round number: the control's code is identical in both
+sweeps, so what it reproduces is the floor on what either can resolve, and the
+generator complains on stderr if the sweeps ever drift wider than the band it
+calls drift. `tab-cost.tex` is still generated as the training-run record but is
+no longer `\input`: its `ms/step` predates the `bench_*` protocol that
+supersedes it.
 
-The prose is held near 3,000 words, with no em-dashes, no first person and no
-bullet lists. The two open decisions it deliberately does not settle are which
-split to standardise on and whether S moves to 64.
+The prose is held near 4,000 words, with no em-dashes, no first person and no
+bullet lists, and the count that budget refers to is
+
+    cd paper && cat main.tex sections/*.tex | grep -v '^\s*%' | wc -w
+
+The two open decisions it deliberately does not settle are which split to
+standardise on and whether S moves to 64.
 
 The prose cites for real and `\nocite{*}` is gone, so an entry in
 `references.bib` that loses its last citation silently vanishes from the

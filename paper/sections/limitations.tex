@@ -16,13 +16,13 @@ large embedding table.
 
 \paragraph{The measurement is bounded by the card and by one axis.}
 The card throttles, so the two sweeps are comparable only to about $1\%$: with
-per-point cooldown the later one still started a few degrees warmer and the same region
-comes out a few percent slower for it. That is what the unchanged control arm is for,
-and no claim in Section~\ref{sec:cost:fusion} rests on a difference smaller than the
-drift measured on it. The low-rank arm at $B = 256$ allocated with $248$\,MB of
-$6144$\,MB free and then ran at about four times what its own curve predicts, because
-past a couple of hundred megabytes of headroom the driver backs allocations with host
-memory and the step time stops being a property of the kernels; on WSL2
+per-point cooldown the later one still started a few degrees warmer. That is what the
+unchanged control arm is for, it is where the band of
+Section~\ref{sec:cost:crossover} comes from, and no claim in
+Section~\ref{sec:cost:fusion} rests on a difference smaller than it. The low-rank arm
+at $B = 256$ allocated with $248$\,MB of $6144$\,MB free and then ran at about four
+times what its own curve predicts, because past a couple of hundred megabytes of
+headroom the driver backs allocations with host memory; on WSL2
 \texttt{cudaMalloc} succeeds in that state, so the guard is a headroom floor and that
 arm's sweep ends at $B = 128$. The sweep also varies $B$ at $T = 64$ throughout, so
 what is measured is a dependence on batch size and not on tokens per step. One training
@@ -36,8 +36,8 @@ $100{,}000$ steps at $256$ tokens per step is $28\%$ of one epoch, so every qual
 number is what a method does at a fixed step budget. Loss tracks the injected noise
 scale monotonically across arms, so an arm that samples less aggressively looks better
 on predictive metrics for a reason unrelated to its posterior, and the
-off-distribution stream is uniform-random token ids rather than shifted text, which
-supports no comparison with the shift literature \citep{ovadia2019trust}. The low-rank
+off-distribution stream is uniform-random ids rather than shifted text, supporting no
+comparison with the shift literature \citep{ovadia2019trust}. The low-rank
 arm is Bayesian over $96\%$ of the model and the ensemble evaluates at $S = E = 5$, so
 a mixture metric read across arms compares different coverage and different sample
 counts.

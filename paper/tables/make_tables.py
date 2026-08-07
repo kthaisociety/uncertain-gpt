@@ -15,10 +15,10 @@ Inputs (both optional; whatever is missing becomes a placeholder):
                      line uq_evaluate() prints.
 
 Outputs: paper/tables/generated/tab-{cost,quality,uncertainty,ood,posterior,
-bandwidth,amortization,fusion}.tex, each a bare `tabular` the document wraps in
-a float. The last four are the cost tables and come from the `bench:` and
-`bench-region:` lines; tab-cost is the training-run record from results.csv and
-is generated but not currently displayed.
+bandwidth,amortization,fusion,crossover}.tex, each a bare `tabular` the document
+wraps in a float. The last five are the cost tables and come from the `bench:`
+and `bench-region:` lines; tab-cost is the training-run record from results.csv
+and is generated but not currently displayed.
 
 Those files are COMMITTED -- they are measurements, and CI has no runs/ to
 remake them from -- so a run with nothing measured behind it leaves them alone
@@ -233,6 +233,14 @@ BYTES_PER_ELEM = 4
 # The arms that draw a weight vector. The control has no posterior region, so
 # it has no row in the tables that price one.
 BAYES_ARMS = ["BBB", "Vadam", "LowR"]
+
+# The band inside which a difference is drift rather than a result. The control
+# arm's code is identical in both sweeps, so what it reproduces of itself is the
+# floor on what either sweep can resolve, and nothing smaller is separable from
+# the card's thermal state. It is a constant here because the prose states it
+# too; crossover_table() checks it against the control's own rows and says so on
+# stderr if the sweeps ever drift wider than this.
+DRIFT_BAND = 0.01
 
 
 def read_bench_records(paths):
@@ -646,6 +654,77 @@ def fusion_table(bench, before, after, srcs):
         "source: %s (%s vs %s)" % (srcs, before, after))
 
 
+def crossover_table(bench, before, after, srcs, band=DRIFT_BAND):
+    """Where each arm stops being worth folding, as one batch size per arm.
+
+    Folding deletes a fixed number of buffer touches, so what it returns is a
+    fixed wall-clock per step, and a fixed quantity amortises exactly as the
+    posterior's own cost does. The decision therefore reduces to the batch size
+    at which that fixed saving falls inside `band` -- below which it is not
+    separable from the drift the control arm measures.
+
+    The denominator is the UNFUSED step, which is what a reader who has not
+    written the fused kernel is paying. The ms columns are total O(P) work, not
+    the Bayesian subset, for the reason fusion_table gives: after folding, only
+    the total means the same thing in both variants.
+
+    B* is a measured grid point and the grid is octaves, so it brackets the
+    crossover rather than locating it. The two ends are rendered as bounds
+    rather than as a batch size: an arm already inside the band at the smallest
+    point measured has no regime where folding pays, and one still outside it at
+    the largest point pays everywhere this card can reach."""
+    def paired(key):
+        return [(B, bench[(before, key, B)], bench[(after, key, B)])
+                for (t, a, B) in sorted(bench, key=lambda k: k[2])
+                if t == before and a == key and (after, key, B) in bench]
+
+    seen = [{B for B, _, _ in paired(k)} for k in BAYES_ARMS]
+    common = set.intersection(*seen) if all(seen) else set()
+    B_lo, B_hi = (min(common), max(common)) if common else (None, None)
+
+    # The control's own before/after difference IS the drift, so a band narrower
+    # than what it reproduces would be calling measurement noise a result.
+    drift = max((abs(pre["paramwork"] - post["paramwork"]) / pre["total"]
+                 for _, pre, post in paired("Ens")), default=0.0)
+    if drift > band:
+        print("make_tables: control arm drifts %.2f%% between the sweeps, wider "
+              "than the %.2f%% band tab-crossover calls drift" %
+              (100.0 * drift, 100.0 * band), file=sys.stderr)
+
+    body = []
+    for key in BAYES_ARMS:
+        rows = paired(key)
+        if not rows:
+            body.append([key] + [NA] * 6)
+            continue
+        rec = {B: pre["paramwork"] - post["paramwork"] for B, pre, post in rows}
+        frac = {B: rec[B] / pre["total"] for B, pre, _ in rows}
+        share = {B: pre["share"] for B, pre, _ in rows}
+        Bs = [B for B, _, _ in rows]
+        inside = [B for B in Bs if frac[B] <= band]
+        if not inside:
+            star = "$> %d$" % Bs[-1]
+        elif inside[0] == Bs[0]:
+            star = r"$\leq %d$" % Bs[0]
+        else:
+            star = str(inside[0])
+        pct = lambda v: NA if v is None else fmt(100.0 * v, 2) + r"\%"
+        body.append([
+            tex_escape(canon(rows[0][1]["arm"])[1]),
+            fmt(min(rec.values()), 3), fmt(max(rec.values()), 3),
+            pct(frac.get(B_lo)), pct(frac.get(B_hi)), pct(share.get(B_hi)),
+            star,
+        ])
+    return table(
+        ["Arm", "Folding returns (ms, min)", "(max)",
+         r"\%% of step at $B=%s$" % (B_lo if B_lo else "?"),
+         r"at $B=%s$" % (B_hi if B_hi else "?"),
+         r"Posterior \%% at $B=%s$" % (B_hi if B_hi else "?"), "$B^\\ast$"],
+        "lrrrrrr", body,
+        "source: %s (%s vs %s, band %.0f%%)"
+        % (srcs, before, after, 100.0 * band))
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.abspath(os.path.join(here, "..", ".."))
@@ -686,6 +765,8 @@ def main():
         "tab-amortization.tex": amortization_table(bench, args.bench_after, srcs),
         "tab-fusion.tex": fusion_table(bench, args.bench_before,
                                        args.bench_after, srcs),
+        "tab-crossover.tex": crossover_table(bench, args.bench_before,
+                                             args.bench_after, srcs),
     }
     made = stamp(root)
     actions = {name: write_fragment(os.path.join(args.out, name), text, made)
@@ -791,6 +872,37 @@ def selftest():
     # the fusion table's share ratio is post-share over pre-share
     ft = fusion_table(sweep, "pre", "post", "none")
     assert "20.0 & 10.0 & 0.50" in ft and "10.0 & 5.0 & 0.50" in ft, ft
+
+    # the crossover: folding returns a FIXED ms, so its share of the step falls
+    # as the step grows, and B* is the first measured point at which it lands
+    # inside the drift band. One arm per rendering -- a crossover inside the
+    # sweep, one at or below its smallest point, one past its largest.
+    xs = {}
+    for B, total in ((1, 10.0), (2, 20.0), (4, 100.0)):
+        for arm, pre_pw, post_pw in (("bbb", 2.0, 1.0), ("vadam", 2.0, 2.0),
+                                     ("lowr", 12.0, 2.0), ("ens", 1.0, 1.0)):
+            key = canon(arm)[0]
+            xs[("pre", key, B)] = brec("pre", arm, B, 1.5, pre_pw, total)
+            xs[("post", key, B)] = brec("post", arm, B, 1.5, post_pw, total)
+    ct = crossover_table(xs, "pre", "post", "none")
+    assert NA not in ct, ct
+    assert r"BBB & 1.000 & 1.000 & 10.00\% & 1.00\% & 1.50\% & 4" in ct, ct
+    assert r"Vadam & 0.000 & 0.000 & 0.00\% & 0.00\% & 1.50\% & $\leq 1$" in ct, ct
+    assert r"LowR & 10.000 & 10.000 & 100.00\% & 10.00\% & 1.50\% & $> 4$" in ct, ct
+    # the band is what B* means: widen it and the same measurement crosses
+    # earlier, because less of the saving is separable from drift.
+    assert r"1.50\% & 2 " in crossover_table(xs, "pre", "post", "none", 0.06)
+    # ...and a control arm that does not reproduce itself inside the band says
+    # so, because then the band is not the floor the table claims it is.
+    import contextlib, io
+    drifted = dict(xs)
+    drifted[("post", "Ens", 1)] = brec("post", "ens", 1, 0.0, 2.0, 10.0)
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        crossover_table(drifted, "pre", "post", "none")
+    assert "control arm drifts 10.00%" in err.getvalue(), err.getvalue()
+    assert crossover_table({}, "pre", "post", "none").count(NA) \
+        == len(BAYES_ARMS) * 6
     # bandwidth: touches x P x 4 bytes over the measured time, and a region
     # with no measurement stays unmeasured rather than becoming a zero.
     TOUCHES[("pre", "bbb")] = {"r0": 2}

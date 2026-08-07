@@ -19,7 +19,8 @@ TABLES   := tables/generated/tab-cost.tex \
             tables/generated/tab-posterior.tex \
             tables/generated/tab-bandwidth.tex \
             tables/generated/tab-amortization.tex \
-            tables/generated/tab-fusion.tex
+            tables/generated/tab-fusion.tex \
+            tables/generated/tab-crossover.tex
 FIGURES  := tables/generated/fig-s-convergence.tex
 
 .PHONY: all pdf tables figures check clean distclean

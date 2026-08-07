@@ -26,10 +26,10 @@ rather than stored.
 Step times come from the real training step with CUDA event marks at region
 boundaries, one region per kernel group, rather than from a copy of it that can drift,
 and a region's name records whether its cost is $O(P)$ and Bayesian, $O(P)$ and paid by
-a deterministic trainer too, or $O(B \cdot T)$. Warm-up is discarded, $30$ steps at $B
-\leq 8$ falling to $10$ at $B = 256$, and the statistic is a median over the $40$ to
-$270$ retained steps with $p25$ and $p75$ beside it, so a throttled bimodal sample
-stays visible instead of smearing into a mean. Temperature and SM clock are probed
+a deterministic trainer too, or $O(B \cdot T)$. Warm-up is discarded, $30$ steps
+falling to $10$ at the top of the sweep, and the statistic is a median over the
+retained steps with $p25$ and $p75$ beside it, so a throttled bimodal sample stays
+visible instead of smearing into a mean. Temperature and SM clock are probed
 every $20$ steps and printed with each measurement, the binary aborts above
 $89$\,\textdegree C, and the driver idles between points until the card is under
 $72$\,\textdegree C. A point with less than $384$\,MB of VRAM headroom is reported out

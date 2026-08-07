@@ -10,9 +10,9 @@ region in Table~\ref{tab:bandwidth} runs within a few percent of every other one
 buffer walked, so a strategy's per-step training cost on this card is its touch count
 times $44.2$\,MB divided by the bandwidth its kernels achieve: about $240$\,GB/s for
 a sequence walking three or four buffers each, about $190$ for one kernel holding
-eight. That estimate is available from a method's definition, by counting the buffers
-it keeps and the reads and writes a step makes of each, less the eight touches a
-deterministic AdamW step was paying anyway.
+eight. That estimate is available from a method's definition: the buffers it
+keeps and the reads and writes a step makes of each, less the eight a deterministic
+AdamW step was paying anyway.
 
 The same count says which strategies a larger batch cannot rescue, since amortisation
 followed from the numerator being fixed, and it is fixed because the state is
@@ -30,6 +30,5 @@ Where folding stops paying is also a count. Two of the three Bayesian arms reach
 floor their state implies, and the gap between the traffic removed and the time
 recovered is bandwidth a wider kernel gives up, which grows with the live state it
 holds. The low-rank arm's remaining region is not a bandwidth problem at all: its KL
-setup blocks on host round-trips and small per-layer cuBLAS calls. Sweeping $T$ as well
-as $B$ would separate a dependence on tokens per step from one on batch size, and like
-everything above it runs from the checkpoints and logs already in the repository.
+setup blocks on host round-trips and small per-layer cuBLAS calls. The state that
+leaves it the one arm with no batch above its crossover also stops its sweep.

@@ -46,10 +46,10 @@ python3 paper/tables/make_tables.py --selftest   # parser self-check
   tag is the filename, so the two must not be merged by recency.
 
 and writes `tables/generated/tab-{cost,quality,uncertainty,ood,posterior,
-bandwidth,amortization,fusion}.tex`, which the sections `\input`. Those files
-are **committed**; see below.
+bandwidth,amortization,fusion,crossover}.tex`, which the sections `\input`.
+Those files are **committed**; see below.
 
-The four cost tables carry the paper's headline. `tab-posterior` is the
+The five cost tables carry the paper's headline. `tab-posterior` is the
 directly timed Bayesian work per arm over the sweep and is stated for the
 **unfused** variant, because after fusing the Bayesian update shares a kernel
 with the deterministic one and only total *O(P)* work is separable; that is
@@ -59,6 +59,19 @@ achieved bandwidth using touch counts read off the launch sites, which is the
 one place in the generator where a number comes from source rather than from a
 log — and the check on it is the table itself, since a wrong count puts its
 region off the band the others sit in.
+
+`tab-crossover` is the decision the other two cost tables imply together: the
+batch size at which what folding returns stops being separable from drift.
+The threshold is **not a chosen round number**. The control arm's code is
+identical in both sweeps, so what it reproduces of itself is the floor on what
+either sweep can resolve, and that is `DRIFT_BAND` — 1%, the same band the
+prose of `sec:cost:fusion` states. The generator checks the constant against
+the control's own before/after rows and says so on stderr if the sweeps ever
+drift wider than the band the table calls drift. Two cells are rendered as
+bounds rather than as a batch size, because the sweep is octaves and does not
+bracket every arm: `$\leq B_{\min}$` where an arm is already inside the band at
+the smallest point measured, `$> B_{\max}$` where it is still outside at the
+largest.
 
 `tab-cost.tex` is still generated but **no longer `\input` by the paper**: its
 `ms/step` column is a whole-run average from before the timing protocol

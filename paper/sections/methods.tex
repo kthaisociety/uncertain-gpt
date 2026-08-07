@@ -63,7 +63,7 @@ layer plus four global, $122$ units at $r = 8$, folding to one launch per layer 
 $58$. It is the one arm left above its floor: its KL setup goes through a cuBLAS
 call per layer and a Cholesky on the host, so it cannot fold into the update it
 feeds, needs a reduction over each layer rather than one index, and round-trips $r
-\times r$ matrices through the host.
+\times r$ matrices.
 
 \paragraph{Deep ensemble (control).}
 $E = 5$ deterministic models \citep{lakshminarayanan2017simple} differing only in
@@ -73,6 +73,6 @@ The arm stores no posterior and introduces no kernels, so its step is the
 deterministic two launches and eight touches, already at the floor. It is left
 unfused on purpose: its in-training output is the reference the repository is
 calibrated against and its code is identical in both sweeps, which makes it the
-drift control in Section~\ref{sec:cost}. Its cost sits elsewhere, at $E$ times the
-step, $E$ times the memory, $E$ training runs, and an evaluation-time sample count
-capped at the members it paid to train.
+drift control in Section~\ref{sec:cost}. Its cost sits elsewhere: $E$ times the step,
+$E$ times the memory, $E$ training runs, and an evaluation sample count capped at the
+members it trained.
