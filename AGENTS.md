@@ -70,6 +70,40 @@ built against (`torch.version.cuda`) — torch refuses the build otherwise, and 
 is right to. The system `nvcc` is not necessarily that one. `make NVCC=<path>`
 builds the binaries with the same toolchain, which is what a timing comparison
 against the wrapper requires.
+
+## Performance measurement
+
+`ms/step` used to be a lower bound rather than a measurement. It now has a
+protocol, in the `bench_*` harness in `gpt2_kernels.cuh`:
+
+    <binary> bench [B] [steps] [warmup]     # one arm, one batch size
+    ./bench_sweep.sh <tag>                  # the whole B sweep into runs/bench/<tag>/
+
+It is the REAL training step with marks inserted, not a copy of it — so it
+cannot drift from what training does. Regions are labelled by cost class in
+the first character of the name: `*` = O(P) and Bayesian, `+` = O(P) but a
+deterministic trainer pays it too, unprefixed = O(B·T). Warm-up is discarded,
+the statistic is a median with p25/p75, and every `bench:` line carries the
+temperature and SM-clock range it was taken at. `make_tables.py` parses
+`bench:` into `tab-amortization.tex` / `tab-fusion.tex`, so that format is
+pinned like the `step`/`summary:` ones.
+
+Three traps this hit, all of which produce plausible wrong numbers:
+
+- **A `cudaMalloc` that SUCCEEDS is not proof the point is measurable.** Under
+  ~384 MB of free VRAM the driver backs allocations with host memory and step
+  time stops measuring the kernels — LowR at B=256 sat at 248 MB free and ran
+  4x its own curve's prediction. `bench_vram_ok()` now refuses those points as
+  out of range instead of reporting them.
+- **Do not compare absolute ms across two sweeps.** The card's cooling fault
+  means a later sweep runs 6–10 °C hotter and the IDENTICAL model region comes
+  out 1–5% slower. `train_ensemble` is the drift control: its code does not
+  change, so pre-vs-post on that arm is pure measurement drift.
+- **Byte counts are cross-checked, not trusted.** Converting each region's
+  time to achieved bandwidth must put every region in one band (235–254 GB/s
+  here, aggregate 240 GB/s = the 92.4%-of-achievable ceiling). A region off
+  the band means the touch count for it is wrong.
+
 ## Kernel correctness
 
 `dev/` holds one file per kernel, each checked against a CPU reference; see
@@ -84,6 +118,32 @@ an arm's `main()` — so they test the REAL kernels, not a copy that can drift.
 `block_loop` gradient-checks the `L>1` block loop, which `train_bnn.c` cannot
 cover at all (it is single-block).
 
+`dev/fused.cu` is the gate on the FUSED parameter updates (`k_bbb_step_fused`,
+`k_vadam_step_fused`, `k_lowrank_step_fused`): it runs each fused kernel and
+the kernels it replaced on identical inputs and compares every output. It
+builds TWICE —
+
+    make -C dev fused fused_nofma && ./dev/fused && ./dev/fused_nofma
+
+— because production flags let nvcc contract multiply-adds differently in a
+fused kernel than in a standalone one, and no tolerance can separate "the
+compiler rounded differently" from "the arithmetic changed". `fused_nofma`
+adds `-fmad=false` and demands EXACT bit equality; that is what makes the
+equivalence a result rather than a claim. **The unfused kernels must stay:**
+eval draws with them, each loop primes with them, and this file checks against
+them.
+
+**Two gates that look sufficient and are not:**
+
+- **The eval harness cannot see a training-path change.** It loads `runs/*.bin`
+  and draws with the sample kernels, so a broken fused update passes it. The
+  gate that works is a trajectory diff: rebuild the previous `.cu` files from
+  git into a scratch tree, run both for ~100 steps in NORMAL mode (overfit is
+  not reproducible, see Sharp edges) and diff the `step` lines with the `ms`
+  column stripped — it differs run to run by construction.
+- **`train_ensemble` must be diffed too,** step lines and both `summary:`
+  lines. It is the reference this repo is calibrated against.
+
 **Two traps these hit, which any new numerical check here will hit too:**
 
 - **Never normalize an error by `|want|`.** Vadam's line 5 and a random
@@ -91,6 +151,15 @@ cover at all (it is single-block).
   relative error against `|want|` is 100% on correct arithmetic. Normalize by
   the scale of the computation (sum of the input terms, or `||g||`), the way
   `train_bnn_lowrank.cu`'s check 3 already does for its off-diagonals.
+  ULP-at-the-value's-own-magnitude is the same mistake in disguise, and it cost
+  `dev/fused.cu` a false 21,475-ULP failure; it scores at
+  `max(|value|, buffer RMS)` now.
+- **Draw Adam's `m` and `v` TOGETHER.** They accumulate from the same
+  gradient, so `v ~ m^2` and the update `m/(sqrt(v)+eps)` is O(1). Drawing them
+  independently over wide log ranges manufactures states that never occur
+  (m=1, v=1e-14 moves a parameter by 1e5x its own size in one step) and turns
+  a 1-ULP difference into an apparent catastrophe. `adam_state()` in
+  `dev/fused.cu`.
 - **A float32 forward cannot resolve a single-parameter finite difference**
   at this size: the signal `2*h*g_i` is the size of the loss's own noise.
   Perturb a whole tensor along a Rademacher direction instead, with `h`
@@ -117,10 +186,11 @@ cover at all (it is single-block).
   amplifies in a steeply falling loss — so compare final nll and shape, not
   digits. Normal-mode runs ARE reproducible and are the regression check to use.
 - **Some `.cu` file headers still quote C=768 numbers.** `train_bnn_lowrank.cu`
-  says "7,077,888 params, 8.3% of 85,120,849"; `train_bnn_gpu.cu` says
-  "340 MB/buffer". At the current `Config` (C=384, L=6) it is 10,616,832 of
-  11,061,531 (96%) and 44 MB/buffer. Recompute from the `Config` literal and
-  `param_offsets` — never copy a count out of a header comment.
+  says "7,077,888 params, 8.3% of 85,120,849". At the current `Config`
+  (C=384, L=6) it is 10,616,832 of 11,061,531 (96%) and 44 MB/buffer.
+  Recompute from the `Config` literal and `param_offsets` — never copy a count
+  out of a header comment. (`train_bnn_gpu.cu`'s header was the other offender
+  and now states buffer counts in units of P instead.)
 - **Head size must be exactly `HS` = 64.** `HS` is a compile-time define and the
   FlashAttention kernels index q/k/v with it, so any config where `C/NH != 64`
   read past every head. `gpt2_forward` now `UNCERTAIN_ABORT`s with a message;

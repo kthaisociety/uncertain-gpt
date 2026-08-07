@@ -180,6 +180,63 @@ def read_eval_records(paths):
     return records
 
 
+# --------------------------------------------------------------------------
+# runs/bench_*.log  ->  amortization records
+#
+# Format, from bench_report() in gpt2_kernels.cuh. One line per (arm, B):
+#   bench: arm %s | B %d | T %d | tokens %d | params %zu | steps %d
+#          | warmup %d | total %f ms | posterior %f ms | paramwork %f ms
+#          | model %f ms | share %f | p25 %f | p75 %f
+#          | temp %d-%d C | sm %d-%d MHz
+#
+# The variant tag is the filename: runs/bench_pre.log is before fusion,
+# runs/bench_post.log after. Two variants of the same (arm, B) are what the
+# fusion table subtracts, so they must not be merged by recency the way eval
+# records are.
+# --------------------------------------------------------------------------
+RE_BENCH = re.compile(
+    r"^bench:\s+arm\s+(\S+)\s+\|\s+B\s+(\d+)\s+\|\s+T\s+(\d+)\s+\|\s+tokens\s+(\d+)"
+    r"\s+\|\s+params\s+(\d+)\s+\|\s+steps\s+(\d+)\s+\|\s+warmup\s+(\d+)"
+    r"\s+\|\s+total\s+(\S+)\s+ms\s+\|\s+posterior\s+(\S+)\s+ms"
+    r"\s+\|\s+paramwork\s+(\S+)\s+ms\s+\|\s+model\s+(\S+)\s+ms"
+    r"\s+\|\s+share\s+(\S+)\s+\|\s+p25\s+(\S+)\s+\|\s+p75\s+(\S+)"
+    r"\s+\|\s+temp\s+(-?\d+)-(-?\d+)\s+C\s+\|\s+sm\s+(-?\d+)-(-?\d+)\s+MHz")
+
+BENCH_TAG = re.compile(r"^bench_(\w+)\.log$")
+
+
+def read_bench_records(paths):
+    """One record per (variant, arm, B). Later lines win within a file, so a
+    re-run of one point can simply be appended."""
+    out = {}
+    for path in paths:
+        m = BENCH_TAG.match(os.path.basename(path))
+        if not m:
+            continue
+        tag = m.group(1)
+        try:
+            fh = open(path, errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                b = RE_BENCH.match(line)
+                if not b:
+                    continue
+                g = b.groups()
+                out[(tag, canon(g[0])[0], int(g[1]))] = {
+                    "tag": tag, "arm": g[0], "B": int(g[1]), "T": int(g[2]),
+                    "tokens": int(g[3]), "params": int(g[4]),
+                    "steps": int(g[5]), "warmup": int(g[6]),
+                    "total": num(g[7]), "posterior": num(g[8]),
+                    "paramwork": num(g[9]), "model": num(g[10]),
+                    "share": num(g[11]), "p25": num(g[12]), "p75": num(g[13]),
+                    "temp_lo": int(g[14]), "temp_hi": int(g[15]),
+                    "sm_lo": int(g[16]), "sm_hi": int(g[17]),
+                }
+    return out
+
+
 def pick(records, key, split):
     """Best record for an arm: preferred split first, then most recent."""
     cands = [r for r in records if canon(r["arm"])[0] == key]
@@ -370,6 +427,74 @@ def ood_table(records, srcs):
                   "lrrrr", body, "source: %s" % srcs), disagreed)
 
 
+def amortization_table(bench, tag, srcs):
+    """The measured curve: what fraction of a step the posterior owns, as B
+    grows with T held. One row per batch size, one column pair per arm.
+
+    The posterior column is DIRECTLY timed -- the Bayesian work is in its own
+    kernel launches and each is bracketed by CUDA events -- so no column here
+    is a difference against a deterministic baseline that also differs
+    elsewhere. Ens is the control: it samples nothing, so its ms/step column
+    is what the same network costs with no posterior at all.
+
+    The percentage is ALL parameter-sized work over the step, not only the
+    Bayesian part. That is deliberate. Fusing folded the plain-AdamW and the
+    memset into the same kernel as the posterior update, so a Bayesian-only
+    column stops meaning the same thing before and after, while total O(P)
+    work means the same thing in both. It is therefore an upper bound on the
+    posterior\'s own share -- and Ens\'s column is exactly what that O(P)
+    floor costs when there is no posterior at all."""
+    Bs = sorted({k[2] for k in bench if k[0] == tag})
+    body = []
+    for B in Bs:
+        rows = {key: bench.get((tag, key, B)) for key in ARMS}
+        got = next((r for r in rows.values() if r), None)
+        cells = [str(B), str(got["tokens"]) if got else NA]
+        for key in ARMS:
+            r = rows.get(key)
+            cells += [fmt(r["total"], 2) if r else NA,
+                      fmt(100.0 * r["paramwork"] / r["total"], 1) if r else NA]
+        body.append(cells)
+    header = ["$B$", "Tokens/step"]
+    for key in ARMS:
+        header += ["%s ms" % key, r"%s $O(P)$\%%" % key]
+    return table(header, "rr" + "rr" * len(ARMS), body,
+                 "source: %s (variant %s)" % (srcs, tag))
+
+
+def fusion_table(bench, before, after, srcs):
+    """What fusing the parameter-sized passes bought, per arm and per B.
+
+    Both the O(P) columns and the share are TOTAL parameter-sized work, not
+    the Bayesian subset: the fused kernel absorbed the plain-AdamW pass and
+    the memset, so only the total is comparable across the two variants. See
+    amortization_table.
+
+    A row exists only where BOTH variants measured that (arm, B) -- a speedup
+    against a point that was never measured is not a measurement."""
+    keys = sorted({(k[1], k[2]) for k in bench if k[0] in (before, after)},
+                  key=lambda ab: (ARM_ORDER.get(ab[0], len(ARM_ORDER)), ab[1]))
+    body = []
+    for arm, B in keys:
+        pre, post = bench.get((before, arm, B)), bench.get((after, arm, B))
+        if not (pre and post):
+            continue
+        body.append([
+            tex_escape(canon(pre["arm"])[1]), str(B),
+            fmt(pre["paramwork"], 2), fmt(post["paramwork"], 2),
+            fmt(ratio(pre["paramwork"], post["paramwork"]), 2),
+            fmt(pre["total"], 2), fmt(post["total"], 2),
+            fmt(100.0 * pre["paramwork"] / pre["total"], 1),
+            fmt(100.0 * post["paramwork"] / post["total"], 1),
+        ])
+    return table(
+        ["Arm", "$B$", "$O(P)$ ms before", "$O(P)$ ms after", "$\\times$",
+         "ms/step before", "ms/step after", "$O(P)$ \\% before",
+         "$O(P)$ \\% after"],
+        "lrrrrrrrr", body,
+        "source: %s (%s vs %s)" % (srcs, before, after))
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.abspath(os.path.join(here, "..", ".."))
@@ -378,6 +503,10 @@ def main():
     ap.add_argument("--logs", default=os.path.join(root, "runs"),
                     help="directory scanned for *.log eval output")
     ap.add_argument("--out", default=os.path.join(here, "generated"))
+    # Which bench variant each table speaks for. The amortization curve is
+    # stated for the shipped code (`post`); the fusion table is the pair.
+    ap.add_argument("--bench-before", default="pre")
+    ap.add_argument("--bench-after", default="post")
     args = ap.parse_args()
 
     csv_path = args.csv if os.path.exists(args.csv) else None
@@ -388,6 +517,7 @@ def main():
     rel = lambda p: os.path.relpath(p, root)
     csv_rows = read_csv_rows(csv_path)
     records = read_eval_records(log_paths)
+    bench = read_bench_records(log_paths)
     srcs = ("%d log file(s) under %s" % (len(log_paths), rel(args.logs))
             if log_paths else "(no logs found)")
 
@@ -398,6 +528,9 @@ def main():
         "tab-quality.tex": quality_table(records, srcs),
         "tab-uncertainty.tex": uncertainty_table(records, srcs),
         "tab-ood.tex": ood,
+        "tab-amortization.tex": amortization_table(bench, args.bench_after, srcs),
+        "tab-fusion.tex": fusion_table(bench, args.bench_before,
+                                       args.bench_after, srcs),
     }
     made = stamp(root)
     actions = {name: write_fragment(os.path.join(args.out, name), text, made)

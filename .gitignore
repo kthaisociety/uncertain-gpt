@@ -11,6 +11,7 @@
 !*.cuh
 !*.h
 !*.py
+!*.sh
 !*.md
 !*.svg
 !*.toml

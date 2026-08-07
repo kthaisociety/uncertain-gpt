@@ -165,6 +165,20 @@ static int ens_eval(int argc, char **argv) {
 int main(int argc, char **argv) {
     if (argc > 1 && argv[1][0] == 'e') return ens_eval(argc, argv);
     bool overfit = (argc > 1 && argv[1][0] == 'o');
+    // ./train_ensemble bench [B] [steps] [warmup]. The CONTROL on the
+    // amortization claim: this arm samples nothing, so its O(P) work is the
+    // plain AdamW every trainer pays, and it must amortize for the same
+    // reason. One member is timed — the arm's cost is that times E.
+    //
+    // AND THE CONTROL ON THE FUSION. The other three arms fuse their
+    // parameter update; this one has nothing to fuse. Its whole per-step
+    // O(P) work is one memset and one AdamW — 8 parameter-sized touches,
+    // which is the floor for ANY Adam-trained model, Bayesian or not. Folding
+    // the memset into AdamW would save a launch and no bytes, at the price of
+    // editing the arm whose in-training output is this repo's reference. Left
+    // alone deliberately: an unfused control is what makes the other three
+    // arms' before/after numbers mean something.
+    bool bench = (argc > 1 && argv[1][0] == 'b');
 
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
@@ -173,6 +187,7 @@ int main(int argc, char **argv) {
     CUBLAS_CHECK(cublasCreate(&cublas_handle));
 
     Config cfg = { .B = 4, .T = 64, .C = 384, .V = VOCAB, .NH = 6, .maxT = 1024, .L = NBLOCKS };
+    if (bench && argc > 2) cfg.B = atoi(argv[2]);   // the swept axis; T is held
     ParamOff po = param_offsets(cfg);
     ActOff   a  = act_offsets(cfg);
     size_t n = po.total;
@@ -182,7 +197,11 @@ int main(int argc, char **argv) {
     const float B1 = 0.9f, B2 = 0.999f, AEPS = 1e-8f, WD = 0.0f;
     // steps: default per mode, overridable as `./bin <mode> <steps>`
     int STEPS = overfit ? 200 : 100;      // per member;
-    if (argc > 2) STEPS = atoi(argv[2]);
+    int bench_warm = 20;
+    if (bench) {
+        STEPS = (argc > 3) ? atoi(argv[3]) : 200;
+        if (argc > 4) bench_warm = atoi(argv[4]);
+    } else if (argc > 2) STEPS = atoi(argv[2]);
     const int EVAL_BATCHES = overfit ? 1 : 2;   // ID batches (and as many OOD)
 
     printf("params %zu (%.0f MB/buffer)   E=%d members\n", n, n * 4 / 1e6, E_MEMBERS);
@@ -224,9 +243,16 @@ int main(int argc, char **argv) {
     cudaEvent_t ev0, ev1;
     CUDA_CHECK(cudaEventCreate(&ev0)); CUDA_CHECK(cudaEventCreate(&ev1));
     int grid_n = ceil_div((int)n, BS);
+    Bench bm; bench_init(&bm, bench, STEPS, bench_warm);
+
+    // Out of VRAM headroom: report the point as out of range rather than
+    // spending the full step count measuring a spilling allocation.
+    if (bench && bm.aborted) return 3;
 
     // ---- train the E members, sequentially --------------------------------
-    for (int e = 0; e < E_MEMBERS; e++) {
+    // bench times ONE member: every member's step is identical, so E copies of
+    // it would cost 5x the wall clock and measure the same thing.
+    for (int e = 0; e < (bench ? 1 : E_MEMBERS); e++) {
         printf("member %d | seed %d\n", e, SEEDS[e]);
 
         // the seed's ONLY job: a different starting point in weight space
@@ -243,32 +269,58 @@ int main(int argc, char **argv) {
 
         for (int step = 1; step <= STEPS; step++) {
             CUDA_CHECK(cudaEventRecord(ev0));
+            bench_step_begin(&bm);
             if (!overfit) {
                 loader_next(&ld, h_inp, h_tgt, BT);
                 CUDA_CHECK(cudaMemcpy(d_inp, h_inp, BT * sizeof(int), cudaMemcpyHostToDevice));
                 CUDA_CHECK(cudaMemcpy(d_tgt, h_tgt, BT * sizeof(int), cudaMemcpyHostToDevice));
             }
+            bench_mark(&bm, "data");
             CUDA_CHECK(cudaMemset(d_dw,    0, pb));
+            bench_mark(&bm, "+zero_dw");
             CUDA_CHECK(cudaMemset(d_gacts, 0, a.total * sizeof(float)));
+            bench_mark(&bm, "zero_gacts");
 
             // deterministic: forward/backward straight on the member's params
             float nll = gpt2_forward(d_acts, d_member[e], d_inp, d_tgt, cfg, h_losses);
             gpt2_backward(d_dw, d_gacts, d_acts, d_member[e], d_inp, d_tgt, cfg);
+            bench_mark(&bm, "fwd_bwd");
 
             float bc1 = 1.0f - powf(B1, (float)step);
             float bc2 = 1.0f - powf(B2, (float)step);
             k_adamw<<<grid_n, BS>>>(d_member[e], d_dw, d_m, d_v, n, bc1, bc2,
                                     LR, B1, B2, AEPS, WD);
+            bench_mark(&bm, "+adamw");
 
             CUDA_CHECK(cudaEventRecord(ev1));
             CUDA_CHECK(cudaEventSynchronize(ev1));
             float ms; CUDA_CHECK(cudaEventElapsedTime(&ms, ev0, ev1));
+            bench_step_end(&bm, step);
+
+            if (bench) {
+                if (step == 1 || step % 20 == 0) {
+                    if (bench_probe(&bm, step)) break;
+                    fprintf(stderr, "  bench B=%d step %d/%d  %.2f ms\n",
+                            cfg.B, step, STEPS, ms);
+                }
+                continue;
+            }
 
             // standard scorecard line; sigma/kl are 0 — nothing is sampled here
             if (step == 1 || step % 10 == 0 || step == STEPS)
                 printf("step %4d | nll %8.4f | kl        0.0 | sigma 0.000000 [0.000000, 0.000000] | %7.2f ms\n",
                        step, nll, ms);
         }
+    }
+
+    if (bench) {   // no ensemble eval, no checkpoints — this trained nothing
+        bench_report(&bm, "ens", cfg, n);
+        for (int e = 0; e < E_MEMBERS; e++) cudaFree(d_member[e]);
+        free(h_inp); free(h_tgt); free(h_losses); free(h_par); free(ld.tokens);
+        cudaFree(d_m); cudaFree(d_v); cudaFree(d_dw);
+        cudaFree(d_acts); cudaFree(d_gacts); cudaFree(d_inp); cudaFree(d_tgt);
+        cublasDestroy(cublas_handle);
+        return bm.aborted ? 2 : 0;
     }
 
     /* ---- ensemble evaluation ---------------------------------------------

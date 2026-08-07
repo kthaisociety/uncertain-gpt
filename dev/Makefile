@@ -40,6 +40,26 @@ $(VADAM): %: %.cu ../train_bnn_vadam.cu ../gpt2_kernels.cuh
 block_loop: block_loop.cu ../gpt2_kernels.cuh
 	$(NVCC) $(NVCC_FLAGS) $< -lcublas -o $@
 
+# Equivalence check for the fused parameter updates: the fused kernel against
+# the kernels it replaced, on identical inputs. Includes TWO arms in one
+# translation unit — the same thing uncertain/_C.cu does — so both fusions are
+# checked by one binary.
+#   make -C dev fused && ./dev/fused
+#   make -C dev fused fused_nofma && ./dev/fused && ./dev/fused_nofma
+# TWO builds on purpose. `fused` uses production flags and allows a few ULP,
+# because nvcc contracts multiply-adds differently in the fused kernel's
+# unrolled r-loop than in a standalone AdamW. `fused_nofma` removes that
+# licence with -fmad=false and requires EXACT bit equality — which is what
+# turns "the difference is only contraction" from a claim into a result.
+FUSED_SRC = fused.cu ../train_bnn_gpu.cu ../train_bnn_vadam.cu \
+            ../train_bnn_lowrank.cu ../gpt2_kernels.cuh
+fused: $(FUSED_SRC)
+	$(NVCC) $(NVCC_FLAGS) -DNBLOCKS=6 -DRANK=8 $< -lcublas -o $@
+
+fused_nofma: $(FUSED_SRC)
+	$(NVCC) $(NVCC_FLAGS) -fmad=false -DFUSED_NO_FMAD -DNBLOCKS=6 -DRANK=8 \
+	    $< -lcublas -o $@
+
 clean:
-	rm -f $(KERNELS) $(VADAM) block_loop train_bnn_cpu.o
+	rm -f $(KERNELS) $(VADAM) block_loop fused fused_nofma train_bnn_cpu.o
 .PHONY: all clean vadam

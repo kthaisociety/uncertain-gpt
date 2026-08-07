@@ -98,6 +98,58 @@ __global__ void k_vadam_update(float *mu, float *m, float *s, const float *dw,
     }
 }
 
+/* ===================================================================== *
+ * THE FUSED STEP. The two kernels above, plus the memset, in one pass.
+ *
+ * This arm starts lean — dmu never existed, because Vadam's line 6 reads
+ * the raw gradient — so there is much less to recover here than in BBB, and
+ * that asymmetry is the point of measuring both:
+ *
+ *   BEFORE  3 launches, 11 P-element touches
+ *     k_vadam_sample   mu, s -> w                                     3
+ *     memset dw                                                       1
+ *     k_vadam_update   dw -> m, s, mu   (each read-modify-written)     7
+ *
+ *   AFTER   1 launch, 9 P-element touches
+ *     k_vadam_step_fused   dw(rw), m, s, mu, w                        9
+ *
+ * AND THIS IS THE FLOOR. The method's state is mu, m and s; each must be
+ * read and written once (6). The gradient must be read and re-zeroed (2).
+ * The next sample must be written (1). Nine touches, and every one of them
+ * is at the same index, so one kernel reaches all of them. Vadam cannot go
+ * below nine without dropping a term from the algorithm.
+ *
+ * The sample folds in because sigma = 1/sqrt(N*s + lambda) is a function of
+ * the s this kernel just wrote, and mu is the mu it just wrote. Note the
+ * ORDER that forces: the next sample must use the UPDATED s, which is what
+ * the unfused loop does too (sample at the top of step k+1 reads the s that
+ * step k's update left). k_vadam_sample stays — it is what eval draws with,
+ * what primes the loop, and the reference dev/fused.cu compares against.
+ * ===================================================================== */
+__global__ void k_vadam_step_fused(float *mu, float *m, float *s, float *dw,
+                                   float *w, size_t n, float N, float lambda,
+                                   float bc1, float bc2, float alpha,
+                                   float g1, float g2,
+                                   unsigned long long seed, int step) {
+    size_t i = (size_t)blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= n) return;
+
+    float g = dw[i], mm = mu[i];
+    dw[i] = 0.0f;                                     // next step's memset
+
+    float mi = g1 * m[i] + (1.0f - g1) * (g + lambda * mm / N);      // line 6
+    float si = g2 * s[i] + (1.0f - g2) * g * g;                      // line 7
+    m[i] = mi;
+    s[i] = si;
+    float m_hat = mi / bc1;                                          // line 8
+    float s_hat = si / bc2;
+    float mu_new = mm - alpha * m_hat / (sqrtf(s_hat) + lambda / N); // line 9
+    mu[i] = mu_new;
+
+    // lines 1-3 for the NEXT step, off the s and mu just written.
+    w[i] = mu_new + rsqrtf(N * si + lambda) * philox_normal(seed, step + 1, i);
+}
+
 // Reporting only: mean sigma, and the closed-form KL of N(mu, sigma^2)
 // against the prior N(0, 1/lambda) — same quantity the BBB run prints, so
 // the two logs are directly comparable. sigma_p = 1/sqrt(lambda).
@@ -226,6 +278,8 @@ static int vadam_eval(int argc, char **argv) {
 int main(int argc, char **argv) {
     if (argc > 1 && argv[1][0] == 'e') return vadam_eval(argc, argv);
     bool overfit = (argc > 1 && argv[1][0] == 'o');
+    // ./train_bnn_vadam bench [B] [steps] [warmup] — see the harness in the header.
+    bool bench = (argc > 1 && argv[1][0] == 'b');
 
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
@@ -234,6 +288,7 @@ int main(int argc, char **argv) {
     CUBLAS_CHECK(cublasCreate(&cublas_handle));
 
     Config cfg = { .B = 4, .T = 64, .C = 384, .V = VOCAB, .NH = 6, .maxT = 1024, .L = NBLOCKS };
+    if (bench && argc > 2) cfg.B = atoi(argv[2]);   // the swept axis; T is held
     ParamOff p = param_offsets(cfg);
     ActOff   a = act_offsets(cfg);
     size_t n = p.total;
@@ -251,14 +306,19 @@ int main(int argc, char **argv) {
     // step-1 sigma of exactly 0.02.
     const float MU_INIT_STD = 0.02f;
     float LAMBDA = 1.0f / (MU_INIT_STD * MU_INIT_STD);   // = 2500
-    if (argc > 3) LAMBDA = (float)atof(argv[3]);         // explicit sweep value
+    // argv[3] is the sweep value in train mode and the step count in bench mode.
+    if (!bench && argc > 3) LAMBDA = (float)atof(argv[3]);
     const float S0     = 0.0f;     // s init; 0 -> step-1 sigma is exactly the prior
     const float LR = overfit ? 1e-3f : 1e-4f;   // same lr policy as the BBB file
     const float G1 = 0.9f, G2 = 0.999f;
     const unsigned long long SEED = 20240520ull;
     // steps: default per mode, overridable as `./bin <mode> <steps>`
     int STEPS = overfit ? 200 : 100;
-    if (argc > 2) STEPS = atoi(argv[2]);
+    int bench_warm = 20;
+    if (bench) {
+        STEPS = (argc > 3) ? atoi(argv[3]) : 200;
+        if (argc > 4) bench_warm = atoi(argv[4]);
+    } else if (argc > 2) STEPS = atoi(argv[2]);
 
     printf("params %zu (%.0f MB/buffer)   acts %zu (%.0f MB)\n",
            n, n * 4 / 1e6, a.total, a.total * 4 / 1e6);
@@ -334,37 +394,63 @@ int main(int argc, char **argv) {
 
     cudaEvent_t ev0, ev1;
     CUDA_CHECK(cudaEventCreate(&ev0)); CUDA_CHECK(cudaEventCreate(&ev1));
+    Bench bm; bench_init(&bm, bench, STEPS, bench_warm);
+
+    // Out of VRAM headroom: report the point as out of range rather than
+    // spending the full step count measuring a spilling allocation.
+    if (bench && bm.aborted) return 3;
+
+    // Prime what the fused step hands to its successor: step 1 has no
+    // predecessor to have zeroed dw or drawn its w.
+    CUDA_CHECK(cudaMemset(d_dw, 0, pb));
+    k_vadam_sample<<<grid_n, BS>>>(d_w, d_mu, d_s, n, N, LAMBDA, SEED, 1);
+    CUDA_CHECK(cudaGetLastError());
 
     // ---- the training loop ------------------------------------------------
     for (int step = 1; step <= STEPS; step++) {
         CUDA_CHECK(cudaEventRecord(ev0));
+        bench_step_begin(&bm);
 
         if (!overfit) {
             loader_next(&ld, h_inp, h_tgt, BT);                        // line 4
             CUDA_CHECK(cudaMemcpy(d_inp, h_inp, BT * sizeof(int), cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(d_tgt, h_tgt, BT * sizeof(int), cudaMemcpyHostToDevice));
         }
+        bench_mark(&bm, "data");
 
-        // lines 1-3: perturbed weights. sigma read off the CURRENT s.
-        k_vadam_sample<<<grid_n, BS>>>(d_w, d_mu, d_s, n, N, LAMBDA, SEED, step);
-
-        // gradient accumulators (backward ops all use +=)
-        CUDA_CHECK(cudaMemset(d_dw,    0, pb));
+        // dw was zeroed by the previous step's fused update.
         CUDA_CHECK(cudaMemset(d_gacts, 0, a.total * sizeof(float)));
+        bench_mark(&bm, "zero_gacts");
 
         // line 5: backprop AT theta — the sampled w, not mu.
         float nll = gpt2_forward(d_acts, d_w, d_inp, d_tgt, cfg, h_losses);
         gpt2_backward(d_dw, d_gacts, d_acts, d_w, d_inp, d_tgt, cfg);
+        bench_mark(&bm, "fwd_bwd");
 
-        // lines 6-9: the whole update in one pass over dw.
+        // lines 6-9 plus the next step's lines 1-3, in one pass over dw.
+        // Timed as posterior work because it IS the posterior update — but
+        // note it REPLACES AdamW rather than adding to it, so Vadam's
+        // surcharge over a deterministic trainer is smaller than this region.
         float bc1 = 1.0f - powf(G1, (float)step);
         float bc2 = 1.0f - powf(G2, (float)step);
-        k_vadam_update<<<grid_n, BS>>>(d_mu, d_m, d_s, d_dw, n, N, LAMBDA,
-                                       bc1, bc2, LR, G1, G2);
+        k_vadam_step_fused<<<grid_n, BS>>>(d_mu, d_m, d_s, d_dw, d_w, n,
+                                           N, LAMBDA, bc1, bc2, LR, G1, G2,
+                                           SEED, step);
+        bench_mark(&bm, "*fused_step");
 
         CUDA_CHECK(cudaEventRecord(ev1));
         CUDA_CHECK(cudaEventSynchronize(ev1));
         float ms; CUDA_CHECK(cudaEventElapsedTime(&ms, ev0, ev1));
+        bench_step_end(&bm, step);
+
+        if (bench) {
+            if (step == 1 || step % 20 == 0) {
+                if (bench_probe(&bm, step)) break;    // over temperature
+                fprintf(stderr, "  bench B=%d step %d/%d  %.2f ms\n",
+                        cfg.B, step, STEPS, ms);
+            }
+            continue;
+        }
 
         if (step == 1 || step % 10 == 0 || step == STEPS) {
             k_vadam_stats<<<stat_blocks, BS>>>(d_klp, d_sigp, d_smin, d_smax,
@@ -389,10 +475,12 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!overfit) {
+    bench_report(&bm, "vadam", cfg, n);
+    if (!overfit && !bench) {   // bench must never overwrite the 100k checkpoint
         ckpt_save("vadam", "mu", d_mu, n, cfg, STEPS);
         ckpt_save("vadam", "s",  d_s,  n, cfg, STEPS);   // sigma is derived from s
     }
+    if (bm.aborted) return 2;
     printf("\ndone.\n");
     free(h_inp); free(h_tgt); free(h_losses); free(h_klp); free(h_sigp); free(h_smin); free(h_smax);
     free(ld.tokens);

@@ -983,6 +983,230 @@ __global__ void k_adamw(float *params, const float *grads, float *m, float *v,
     }
 }
 
+/* ===================================================================== *
+ * THE BATCH-SIZE AMORTIZATION HARNESS
+ *
+ *     <binary> bench [B] [steps] [warmup]
+ *
+ * One claim, stated so it can be falsified: forward and backward are
+ * O(B*T) — they scale with the tokens processed — while sampling the
+ * weights and updating the posterior are O(P), once per step, whatever B
+ * is. If that is true the posterior's SHARE of the step must fall roughly
+ * as 1/B, and "Bayesian deep learning is too expensive" is substantially a
+ * statement about small batches.
+ *
+ * The share is MEASURED, never inferred. The Bayesian work is in its own
+ * kernel launches, so each one is bracketed by CUDA events and timed on
+ * the device timeline. Nothing here differences against a deterministic
+ * baseline that also differs in a dozen other ways.
+ *
+ * Every region is labelled by its cost class, in its name's first char:
+ *
+ *     '*'   O(P) and BAYESIAN — sampling, the posterior update, the KL
+ *           term, the second optimizer state. A deterministic trainer of
+ *           the same network does not run it. This is "posterior".
+ *     '+'   O(P) but NOT Bayesian — zeroing dw, AdamW on the mean. A
+ *           deterministic trainer runs these too, and they amortize for
+ *           exactly the same reason, which is the control on the claim.
+ *     none  O(B*T) — the network. This is what is supposed to grow.
+ *
+ * MEASUREMENT PROTOCOL, because ms/step in this repo has been a lower
+ * bound rather than a controlled number (two sessions, a throttling card,
+ * low-rank drifting 52 -> 65 ms mid-run):
+ *
+ *   - warm-up steps are discarded, not averaged in;
+ *   - the reported statistic is the MEDIAN over the retained steps, with
+ *     p25/p75 printed beside it, so a bimodal (throttled) sample is
+ *     visible instead of being smeared into a mean;
+ *   - GPU temperature and SM clock are probed periodically and printed as
+ *     a trace, so a throttled window can be identified after the fact;
+ *   - the run ABORTS over BENCH_TEMP_ABORT C rather than quietly
+ *     producing numbers taken from a thermally limited card.
+ *
+ * paper/tables/make_tables.py parses the `bench:` and `bench-probe:`
+ * lines below. Changing either format breaks the paper's amortization
+ * table, the same way the `step`/`summary:` formats are pinned.
+ * ===================================================================== */
+
+#define BENCH_MAX_REGIONS 12
+#define BENCH_TEMP_ABORT  89     // C. The card has a known cooling fault.
+// Minimum free VRAM, after the arm has allocated, for a point to count.
+// A cudaMalloc that SUCCEEDS is not proof the point is measurable: with a
+// couple of hundred MB left the driver starts backing allocations with host
+// memory and the step time stops being a property of the kernels. LowR at
+// B=256 sat at 248 MB free and took 3342 ms/step against the ~800 ms its own
+// curve predicts — a 4x number that would have looked like a finding. Points
+// under this bar are reported out-of-range instead of measured.
+#define BENCH_VRAM_FLOOR_MB 384
+
+typedef struct { int temp, sm_mhz, ok; } GpuProbe;
+
+// Between steps only — this shells out and takes ~100 ms, which would be
+// nonsense inside a timed region. Device timings are unaffected either way.
+static GpuProbe gpu_probe(void) {
+    GpuProbe g = { -1, -1, 0 };
+    FILE *f = popen("nvidia-smi --query-gpu=temperature.gpu,clocks.sm"
+                    " --format=csv,noheader,nounits 2>/dev/null", "r");
+    if (!f) return g;
+    if (fscanf(f, "%d, %d", &g.temp, &g.sm_mhz) == 2) g.ok = 1;
+    pclose(f);
+    return g;
+}
+
+typedef struct {
+    int on, cap, nrec, nreg, nreg_seen, warmup, nprobe, aborted;
+    const char *name[BENCH_MAX_REGIONS];
+    cudaEvent_t ev[BENCH_MAX_REGIONS + 1];
+    float *reg;                       // [cap][BENCH_MAX_REGIONS]
+    float *tot, *post, *pall;         // per-step: whole step, '*', '*' and '+'
+    int   *pstep, *ptemp, *pclk;
+} Bench;
+
+// Call AFTER the arm has allocated: it is the leftover headroom that decides
+// whether the driver will spill, not the size of the request.
+static int bench_vram_ok(void) {
+    size_t freeb = 0, totalb = 0;
+    if (cudaMemGetInfo(&freeb, &totalb) != cudaSuccess) return 1;
+    double mb = freeb / 1048576.0;
+    if (mb >= BENCH_VRAM_FLOOR_MB) return 1;
+    printf("bench: OUT OF RANGE — only %.0f MB of %.0f MB VRAM free after "
+           "allocation (need %d MB of headroom). The driver spills past this "
+           "point and the step time stops measuring the kernels.\n",
+           mb, totalb / 1048576.0, BENCH_VRAM_FLOOR_MB);
+    return 0;
+}
+
+static void bench_init(Bench *b, int on, int steps, int warmup) {
+    memset(b, 0, sizeof *b);
+    b->on = on;
+    if (!on) return;
+    if (!bench_vram_ok()) { b->on = 0; b->aborted = -1; return; }
+    b->warmup = warmup;
+    b->cap = steps > 0 ? steps : 1;
+    for (int i = 0; i <= BENCH_MAX_REGIONS; i++)
+        CUDA_CHECK(cudaEventCreate(&b->ev[i]));
+    b->reg  = (float *)calloc((size_t)b->cap * BENCH_MAX_REGIONS, sizeof(float));
+    b->tot  = (float *)calloc(b->cap, sizeof(float));
+    b->post = (float *)calloc(b->cap, sizeof(float));
+    b->pall = (float *)calloc(b->cap, sizeof(float));
+    b->pstep = (int *)calloc(b->cap, sizeof(int));
+    b->ptemp = (int *)calloc(b->cap, sizeof(int));
+    b->pclk  = (int *)calloc(b->cap, sizeof(int));
+}
+
+static void bench_step_begin(Bench *b) {
+    if (!b->on) return;
+    b->nreg = 0;
+    CUDA_CHECK(cudaEventRecord(b->ev[0]));
+}
+
+// Closes the region that began at the previous mark (or at the step start).
+static void bench_mark(Bench *b, const char *name) {
+    if (!b->on || b->nreg >= BENCH_MAX_REGIONS) return;
+    b->name[b->nreg] = name;
+    CUDA_CHECK(cudaEventRecord(b->ev[b->nreg + 1]));
+    b->nreg++;
+}
+
+static void bench_step_end(Bench *b, int step) {
+    if (!b->on || b->nreg == 0) return;
+    CUDA_CHECK(cudaEventSynchronize(b->ev[b->nreg]));
+    if (step <= b->warmup || b->nrec >= b->cap) return;
+    int k = b->nrec++;
+    b->nreg_seen = b->nreg;
+    float post = 0.0f, pall = 0.0f;
+    for (int r = 0; r < b->nreg; r++) {
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, b->ev[r], b->ev[r + 1]));
+        b->reg[(size_t)k * BENCH_MAX_REGIONS + r] = ms;
+        char c = b->name[r][0];
+        if (c == '*') { post += ms; pall += ms; }
+        else if (c == '+') { pall += ms; }
+    }
+    // The step total is the single span, not the sum of the parts: the parts
+    // share their boundary events, so the two agree to event resolution, and
+    // the span is the one a caller can check against the training loop's own
+    // ms number.
+    CUDA_CHECK(cudaEventElapsedTime(&b->tot[k], b->ev[0], b->ev[b->nreg]));
+    b->post[k] = post; b->pall[k] = pall;
+}
+
+// Returns 1 if the card is over the abort threshold, so the caller can stop
+// rather than report numbers measured on a thermally limited GPU.
+static int bench_probe(Bench *b, int step) {
+    if (!b->on || b->nprobe >= b->cap) return 0;
+    GpuProbe g = gpu_probe();
+    if (!g.ok) return 0;
+    int i = b->nprobe++;
+    b->pstep[i] = step; b->ptemp[i] = g.temp; b->pclk[i] = g.sm_mhz;
+    if (g.temp >= BENCH_TEMP_ABORT) { b->aborted = g.temp; return 1; }
+    return 0;
+}
+
+static int bench_cmp_f(const void *a, const void *c) {
+    float x = *(const float *)a, y = *(const float *)c;
+    return (x > y) - (x < y);
+}
+
+// Quantile q in [0,1] of the first n samples of v. v is copied, not sorted
+// in place — the caller's per-step arrays stay in step order for the trace.
+static float bench_quantile(const float *v, int n, float q) {
+    if (n <= 0) return 0.0f;
+    float *s = (float *)malloc((size_t)n * sizeof(float));
+    memcpy(s, v, (size_t)n * sizeof(float));
+    qsort(s, n, sizeof(float), bench_cmp_f);
+    int i = (int)(q * (n - 1) + 0.5f);
+    if (i < 0) i = 0;
+    if (i >= n) i = n - 1;
+    float r = s[i];
+    free(s);
+    return r;
+}
+
+static void bench_report(Bench *b, const char *arm, Config cfg, size_t nparams) {
+    if (!b->on) return;
+    int n = b->nrec;
+    if (n == 0) { printf("bench: no retained steps (all warm-up?)\n"); return; }
+
+    float tot  = bench_quantile(b->tot,  n, 0.5f);
+    float post = bench_quantile(b->post, n, 0.5f);
+    float pall = bench_quantile(b->pall, n, 0.5f);
+    int tlo = 1 << 30, thi = -1, clo = 1 << 30, chi = -1;
+    for (int i = 0; i < b->nprobe; i++) {
+        if (b->ptemp[i] < tlo) tlo = b->ptemp[i];
+        if (b->ptemp[i] > thi) thi = b->ptemp[i];
+        if (b->pclk[i]  < clo) clo = b->pclk[i];
+        if (b->pclk[i]  > chi) chi = b->pclk[i];
+    }
+    if (thi < 0) { tlo = thi = clo = chi = -1; }
+
+    // ONE line per (arm, B). Everything downstream reads this.
+    printf("bench: arm %s | B %d | T %d | tokens %d | params %zu | steps %d"
+           " | warmup %d | total %.4f ms | posterior %.4f ms | paramwork %.4f ms"
+           " | model %.4f ms | share %.6f | p25 %.4f | p75 %.4f"
+           " | temp %d-%d C | sm %d-%d MHz\n",
+           arm, cfg.B, cfg.T, cfg.B * cfg.T, nparams, n, b->warmup,
+           tot, post, pall, tot - pall, (double)post / (double)tot,
+           bench_quantile(b->tot, n, 0.25f), bench_quantile(b->tot, n, 0.75f),
+           tlo, thi, clo, chi);
+
+    // Per-region medians, in launch order, so a fusion can be checked pass by
+    // pass rather than only in the total.
+    for (int r = 0; r < b->nreg_seen; r++) {
+        float *col = (float *)malloc((size_t)n * sizeof(float));
+        for (int i = 0; i < n; i++) col[i] = b->reg[(size_t)i * BENCH_MAX_REGIONS + r];
+        printf("bench-region: arm %s | B %d | %-14s | %.4f ms\n",
+               arm, cfg.B, b->name[r], bench_quantile(col, n, 0.5f));
+        free(col);
+    }
+    for (int i = 0; i < b->nprobe; i++)
+        printf("bench-probe: arm %s | B %d | step %d | temp %d C | sm %d MHz\n",
+               arm, cfg.B, b->pstep[i], b->ptemp[i], b->pclk[i]);
+    if (b->aborted)
+        printf("bench: THERMAL ABORT at %d C — numbers above are not usable\n",
+               b->aborted);
+}
+
 /* =====================================================================  *
  *                                                                        *
  *   THE SHARED UNCERTAINTY EVALUATION HARNESS                            *

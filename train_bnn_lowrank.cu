@@ -43,11 +43,15 @@
 
  1. NOT FUSED INTO THE GEMM PROLOGUE. The spec asks for sampling fused into a
     hand-written GEMM. This codebase calls cuBLAS — there is no GEMM of ours
-    to fuse into. More importantly, arms A and C both materialize w with a
-    separate sampling kernel, so fusing ONLY this arm would make the
+    to fuse into. So w is still materialized by a separate sampling kernel,
+    as the spec permits.
+
+    The PARAMETER UPDATE is fused, and was fused in every arm at once, which
+    is the condition this note asked for: k_lowrank_step_fused here,
+    k_bbb_step_fused in train_bnn_gpu.cu, k_vadam_step_fused in
+    train_bnn_vadam.cu. Fusing one arm only would have made the four-arm
     comparison measure kernel engineering rather than posterior structure.
-    Implemented as the "separate kernel" alternative the spec permits, to be
-    measured deliberately. Fusion, if done, should be done to all arms at once.
+    The ensemble control needed no change — see its own note on why.
 
  2. MEMORY IS FAR SMALLER THAN THE SPEC'S ESTIMATE. The spec budgets A at
     2.72 GB (r=8) assuming all 85M params are Bayesian; its own scope section
@@ -226,6 +230,123 @@ __global__ void k_lowrank_kl_grad(float *dtheta, float *dA, float *drhod,
 
         dtheta[poff + i] += weight * lambda * theta[poff + i];   // dKL/dmu
     }
+}
+
+/* ===================================================================== *
+ * THE FUSED VARIANCE STEP.  k_lowrank_backward + k_lowrank_kl_grad +
+ * AdamW on A + AdamW on rhod, per layer, in one pass.
+ *
+ * Same observation that collapses BBB's step, and it is worth stating as
+ * one observation rather than two coincidences: dA and drhod are WRITE-ONLY
+ * ACCUMULATORS. They are zeroed, added to by exactly two kernels, read once
+ * by AdamW, and never looked at again — so they never have to reach memory.
+ * Here it is worth more than in BBB, because dA is R times parameter-sized:
+ * at RANK=8 it is the single largest buffer this arm owns.
+ *
+ * Per Bayesian layer, in units of that layer's P (so A counts as R):
+ *
+ *   BEFORE  2 launches per layer + 4 over the whole buffer,
+ *           122 units at R=8
+ *     memset dA, drhod                                            R + 1
+ *     k_lowrank_backward   dw, rhod read; dA, drhod rmw          2R + 4
+ *     k_lowrank_kl_grad    theta, A, rhod read; dtheta, dA,
+ *                          drhod rmw                              3R + 6
+ *     k_adamw(A)           dA read; mA, vA, A rmw                 7R
+ *     k_adamw(rhod)        drhod read; md, vd, rhod rmw           7
+ *
+ *   AFTER   1 launch per layer, nothing global, 58 units at R=8
+ *     k_lowrank_step_fused dw, theta read; dtheta rmw; A, mA, vA
+ *                          rmw; rhod, md, vd rmw                  6R + 10
+ *
+ * WHY THIS ARM DOES NOT REACH ITS FLOOR, unlike BBB and Vadam. The KL setup
+ * that runs before the sample — B = D^-1 A, then A^T B per layer through
+ * cuBLAS, then a host Cholesky — cannot fold into this kernel: it must
+ * finish before the step it feeds, it needs a full reduction over each
+ * layer rather than one index, and it round-trips r x r matrices through
+ * the host. It is the arm's largest remaining region and it is a latency
+ * problem (2 blocking copies and 2*NBL small launches), not a bandwidth
+ * one, so "move fewer bytes" is the wrong lever for it. Left measured and
+ * unfused rather than quietly excluded.
+ *
+ * dA survives as the scratch k_scale_A_dinv writes B into — but it is no
+ * longer zeroed, read or written by anything else in the step, and drhod is
+ * gone entirely. The kernels this replaces all stay: dev/ checks 1-5 below
+ * are written against them, and this kernel is checked against them too.
+ * ===================================================================== */
+template <int R>
+__global__ void k_lowrank_step_fused(float *dtheta, float *A, float *rhod,
+                                     float *mA, float *vA, float *md, float *vd,
+                                     const float *dw, const float *theta,
+                                     const float *Minv, const float *z,
+                                     size_t poff, size_t aoff, size_t boff, int P,
+                                     float lambda, float weight,
+                                     unsigned long long seed, int step,
+                                     float bc1, float bc2, float lr,
+                                     float beta1, float beta2, float aeps, float wd) {
+    __shared__ float zs[R];
+    __shared__ float Ms[R * R];
+    if (threadIdx.x < R) zs[threadIdx.x] = z[threadIdx.x];
+    for (int t = threadIdx.x; t < R * R; t += blockDim.x) Ms[t] = Minv[t];
+    __syncthreads();
+
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= P) return;
+
+    float g = dw[poff + i];
+    float r = rhod[boff + i];
+    float sg = d_sigmoid(r);
+    float *Ai = A + aoff + (size_t)i * R;
+
+    float ar[R], gA[R];
+    #pragma unroll
+    for (int k = 0; k < R; k++) ar[k] = Ai[k];
+
+    // --- k_lowrank_backward, into registers. dA/drhod started at zero, so
+    //     the "+=" that produced them is just this assignment.
+    #pragma unroll
+    for (int k = 0; k < R; k++) gA[k] = g * zs[k];
+    float grhod = g * philox_normal(seed, step, poff + i) * sg;
+
+    // --- k_lowrank_kl_grad. Uniform branch on a scalar, matching "the launch
+    //     is skipped entirely when KLW == 0" — which also keeps the 1/d out
+    //     of a mode that never computes it.
+    if (weight > 0.0f) {
+        float v[R], quad = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < R; k++) {
+            float s = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < R; j++) s += ar[j] * Ms[j * R + k];
+            v[k] = s;
+            quad += ar[k] * s;
+        }
+        float d   = d_softplus(r);
+        float d2  = fmaxf(d * d, 1e-20f);
+        float inv = 1.0f / d2;
+        #pragma unroll
+        for (int k = 0; k < R; k++)
+            gA[k] += weight * (lambda * ar[k] - inv * v[k]);
+        float dKL_dd = lambda * d - 1.0f / d + quad * inv / d;
+        grhod += weight * dKL_dd * sg;
+        // dKL/dmu still lands in the theta gradient, which the theta AdamW
+        // reads after this kernel — theta is NOT updated here.
+        dtheta[poff + i] += weight * lambda * theta[poff + i];
+    }
+
+    // --- k_adamw over A's R columns, then over rhod. Same expression as the
+    //     shared kernel, once per element instead of once per buffer.
+    float *mAi = mA + aoff + (size_t)i * R, *vAi = vA + aoff + (size_t)i * R;
+    #pragma unroll
+    for (int k = 0; k < R; k++) {
+        float mi = beta1 * mAi[k] + (1.0f - beta1) * gA[k];
+        float vi = beta2 * vAi[k] + (1.0f - beta2) * gA[k] * gA[k];
+        mAi[k] = mi; vAi[k] = vi;
+        Ai[k] = ar[k] - lr * ((mi / bc1) / (sqrtf(vi / bc2) + aeps) + wd * ar[k]);
+    }
+    float m1 = beta1 * md[boff + i] + (1.0f - beta1) * grhod;
+    float v1 = beta2 * vd[boff + i] + (1.0f - beta2) * grhod * grhod;
+    md[boff + i] = m1; vd[boff + i] = v1;
+    rhod[boff + i] = r - lr * ((m1 / bc1) / (sqrtf(v1 / bc2) + aeps) + wd * r);
 }
 
 // Reductions for the KL value and the marginal std sigma_i = sqrt(|A_i|^2+d_i^2),
@@ -449,6 +570,8 @@ int main(int argc, char **argv) {
     if (argc > 1 && argv[1][0] == 'e') return lowr_eval(argc, argv);
     bool overfit = (argc > 1 && argv[1][0] == 'o');
     bool checks  = (argc > 1 && argv[1][0] == 'c');
+    // ./train_bnn_lowrank bench [B] [steps] [warmup] — see the harness header.
+    bool bench   = (argc > 1 && argv[1][0] == 'b');
 
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
@@ -457,6 +580,7 @@ int main(int argc, char **argv) {
     CUBLAS_CHECK(cublasCreate(&cublas_handle));
 
     Config cfg = { .B = 4, .T = 64, .C = 384, .V = VOCAB, .NH = 6, .maxT = 1024, .L = NBLOCKS };
+    if (bench && argc > 2) cfg.B = atoi(argv[2]);   // the swept axis; T is held
     ParamOff po = param_offsets(cfg);
     ActOff   a  = act_offsets(cfg);
     size_t n = po.total;
@@ -488,19 +612,25 @@ int main(int argc, char **argv) {
     const unsigned long long SEED = 20240520ull, ZSEED = 20240520ull ^ 0x9E3779B9ull;
     // steps: default per mode, overridable as `./bin <mode> <steps>`
     int STEPS = overfit ? 200 : 100;
-    if (argc > 2) STEPS = atoi(argv[2]);
+    int bench_warm = 20;
+    if (bench) {
+        STEPS = (argc > 3) ? atoi(argv[3]) : 200;
+        if (argc > 4) bench_warm = atoi(argv[4]);
+    } else if (argc > 2) STEPS = atoi(argv[2]);
 
     size_t pb = n * sizeof(float), ab = Pb * RANK * sizeof(float), db = Pb * sizeof(float);
     printf("params %zu   Bayesian P %zu (%.1f%%, the 4 GEMMs)   A = %.0f MB\n",
            n, Pb, 100.0 * Pb / n, ab / 1e6);
     printf("total VRAM ~%.2f GB\n",
-           (5.0 * pb + 4.0 * ab + 4.0 * db + 2.0 * a.total * sizeof(float)) / 1e9);
+           (5.0 * pb + 4.0 * ab + 3.0 * db + 2.0 * a.total * sizeof(float)) / 1e9);
     printf("note: low-rank costs MORE memory than mean-field. It saves relative to\n"
            "      FULL covariance, which was never feasible. Justification is\n"
            "      posterior quality, not footprint.\n\n");
 
     float *d_theta, *d_w, *d_dw, *d_m, *d_v;
-    float *d_A, *d_dA, *d_mA, *d_vA, *d_rhod, *d_drhod, *d_md, *d_vd;
+    // drhod is gone: the fused variance step keeps it in registers. dA
+    // survives only as the scratch k_scale_A_dinv writes B = D^-1 A into.
+    float *d_A, *d_dA, *d_mA, *d_vA, *d_rhod, *d_md, *d_vd;
     float *d_acts, *d_gacts, *d_z, *d_M, *d_Minv;
     int *d_inp, *d_tgt;
     CUDA_CHECK(cudaMalloc(&d_theta, pb)); CUDA_CHECK(cudaMalloc(&d_w,  pb));
@@ -508,7 +638,7 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaMalloc(&d_v,  pb));
     CUDA_CHECK(cudaMalloc(&d_A,  ab));    CUDA_CHECK(cudaMalloc(&d_dA, ab));
     CUDA_CHECK(cudaMalloc(&d_mA, ab));    CUDA_CHECK(cudaMalloc(&d_vA, ab));
-    CUDA_CHECK(cudaMalloc(&d_rhod, db));  CUDA_CHECK(cudaMalloc(&d_drhod, db));
+    CUDA_CHECK(cudaMalloc(&d_rhod, db));
     CUDA_CHECK(cudaMalloc(&d_md, db));    CUDA_CHECK(cudaMalloc(&d_vd, db));
     CUDA_CHECK(cudaMalloc(&d_acts,  a.total * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_gacts, a.total * sizeof(float)));
@@ -548,7 +678,6 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaMemset(d_mA, 0, ab)); CUDA_CHECK(cudaMemset(d_vA, 0, ab));
     CUDA_CHECK(cudaMemset(d_md, 0, db)); CUDA_CHECK(cudaMemset(d_vd, 0, db));
 
-    int gA = ceil_div((int)(Pb * RANK), BS), gB = ceil_div((int)Pb, BS);
     int gN = ceil_div((int)n, BS);
     const int SB = 256;
     float *dp[7], *hp[7];
@@ -734,14 +863,21 @@ int main(int argc, char **argv) {
 
     cudaEvent_t ev0, ev1;
     CUDA_CHECK(cudaEventCreate(&ev0)); CUDA_CHECK(cudaEventCreate(&ev1));
+    Bench bm; bench_init(&bm, bench, STEPS, bench_warm);
+
+    // Out of VRAM headroom: report the point as out of range rather than
+    // spending the full step count measuring a spilling allocation.
+    if (bench && bm.aborted) return 3;
 
     for (int step = 1; step <= STEPS; step++) {
         CUDA_CHECK(cudaEventRecord(ev0));
+        bench_step_begin(&bm);
         if (!overfit) {
             loader_next(&ld, h_inp, h_tgt, BT);
             CUDA_CHECK(cudaMemcpy(d_inp, h_inp, BT*sizeof(int), cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(d_tgt, h_tgt, BT*sizeof(int), cudaMemcpyHostToDevice));
         }
+        bench_mark(&bm, "data");
 
         // M = I + A^T D^-1 A, per layer, BEFORE dA is used as a gradient.
         // Computed with cuBLAS using dA as scratch for B = D^-1 A.
@@ -765,6 +901,7 @@ int main(int argc, char **argv) {
             }
             CUDA_CHECK(cudaMemcpy(d_Minv, h_Minv, NBL*RANK*RANK*sizeof(float), cudaMemcpyHostToDevice));
         }
+        bench_mark(&bm, "*kl_setup");
 
         k_draw_z<RANK><<<ceil_div(NBL*RANK,128), 128>>>(d_z, NBL, ZSEED, step);          // one z per layer
 
@@ -773,34 +910,54 @@ int main(int argc, char **argv) {
         for (int l = 0; l < NBL; l++)
             k_lowrank_sample<RANK><<<ceil_div(L[l].P, BS), BS>>>(d_w, d_theta, d_A, d_rhod,
                 d_z + l*RANK, L[l].poff, L[l].aoff, L[l].boff, L[l].P, SEED, step);
+        bench_mark(&bm, "*sample");
 
+        // dA and drhod are no longer allocated, so there is nothing here to
+        // zero but the theta gradient and the activation gradients.
         CUDA_CHECK(cudaMemset(d_dw,    0, pb));
-        CUDA_CHECK(cudaMemset(d_dA,    0, ab));
-        CUDA_CHECK(cudaMemset(d_drhod, 0, db));
+        bench_mark(&bm, "+zero_dw");
         CUDA_CHECK(cudaMemset(d_gacts, 0, a.total * sizeof(float)));
+        bench_mark(&bm, "zero_gacts");
 
         float nll = gpt2_forward(d_acts, d_w, d_inp, d_tgt, cfg, h_losses);
         gpt2_backward(d_dw, d_gacts, d_acts, d_w, d_inp, d_tgt, cfg);
+        bench_mark(&bm, "fwd_bwd");
 
-        for (int l = 0; l < NBL; l++)
-            k_lowrank_backward<RANK><<<ceil_div(L[l].P, BS), BS>>>(d_dA, d_drhod, d_dw,
-                d_rhod, d_z + l*RANK, L[l].poff, L[l].aoff, L[l].boff, L[l].P,
-                SEED, step);
-
-        if (KLW > 0.0f)
-            for (int l = 0; l < NBL; l++)
-                k_lowrank_kl_grad<RANK><<<ceil_div(L[l].P, BS), BS>>>(d_dw, d_dA, d_drhod,
-                    d_theta, d_A, d_rhod, d_Minv + l*RANK*RANK,
-                    L[l].poff, L[l].aoff, L[l].boff, L[l].P, LAMBDA, KLW);
-
+        // The sample's backward, the KL gradient and both variance AdamW
+        // passes, per layer, in one pass. See k_lowrank_step_fused.
+        //
+        // d_dw is passed TWICE on purpose: it is the gradient this reads and
+        // the theta-gradient accumulator the KL term adds to, exactly as it
+        // was when k_lowrank_backward read it and k_lowrank_kl_grad wrote it.
+        // Safe because one thread owns index poff+i and reads it before it
+        // writes it — the same ordering the two kernels had between them.
         float bc1 = 1.0f - powf(B1, (float)step), bc2 = 1.0f - powf(B2, (float)step);
+        for (int l = 0; l < NBL; l++)
+            k_lowrank_step_fused<RANK><<<ceil_div(L[l].P, BS), BS>>>(
+                d_dw, d_A, d_rhod, d_mA, d_vA, d_md, d_vd,
+                d_dw, d_theta, d_Minv + l*RANK*RANK, d_z + l*RANK,
+                L[l].poff, L[l].aoff, L[l].boff, L[l].P, LAMBDA, KLW,
+                SEED, step, bc1, bc2, LR_VAR, B1, B2, AEPS, WD);
+        bench_mark(&bm, "*fused_var");
+
+        // theta's own update stays separate: it is over ALL n parameters,
+        // not just the Bayesian layers, so it is not per-layer work.
         k_adamw<<<gN, BS>>>(d_theta, d_dw,    d_m,  d_v,  n,      bc1, bc2, LR, B1, B2, AEPS, WD);
-        k_adamw<<<gA, BS>>>(d_A,     d_dA,    d_mA, d_vA, Pb*RANK, bc1, bc2, LR_VAR, B1, B2, AEPS, WD);
-        k_adamw<<<gB, BS>>>(d_rhod,  d_drhod, d_md, d_vd, Pb,      bc1, bc2, LR_VAR, B1, B2, AEPS, WD);
+        bench_mark(&bm, "+adamw_theta");
 
         CUDA_CHECK(cudaEventRecord(ev1));
         CUDA_CHECK(cudaEventSynchronize(ev1));
         float ms; CUDA_CHECK(cudaEventElapsedTime(&ms, ev0, ev1));
+        bench_step_end(&bm, step);
+
+        if (bench) {
+            if (step == 1 || step % 20 == 0) {
+                if (bench_probe(&bm, step)) break;
+                fprintf(stderr, "  bench B=%d step %d/%d  %.2f ms\n",
+                        cfg.B, step, STEPS, ms);
+            }
+            continue;
+        }
 
         if (step == 1 || step % 10 == 0 || step == STEPS) {
             double a2=0, d2=0, logd=0, mu2=0, smean=0; float lo=1e30f, hi=-1e30f;
@@ -824,6 +981,11 @@ int main(int argc, char **argv) {
             printf("step %4d | nll %8.4f | kl %10.1f | sigma %.6f [%.6f, %.6f] | %7.2f ms\n",
                    step, nll, kl, smean / (double)Pb, lo, hi, ms);
         }
+    }
+
+    if (bench) {   // no summary lines, no checkpoints — this trained nothing
+        bench_report(&bm, "lowr", cfg, n);
+        return bm.aborted ? 2 : 0;
     }
 
     printf("\nsummary: rank %d, Bayesian over %zu params (%.1f%% — the 4 GEMMs only)\n",
