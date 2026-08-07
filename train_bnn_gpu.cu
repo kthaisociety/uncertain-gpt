@@ -215,7 +215,15 @@ static int bbb_eval(int argc, char **argv) {
 
 /* ===================================================================== *
  * main
+ *
+ * Compiled out when this file is INCLUDED by the Python extension, which
+ * defines UNCERTAIN_AS_LIBRARY: four main() symbols cannot coexist in one
+ * module. Only main() is conditional — the arm's kernels AND its eval
+ * callback above stay unconditional, so uncertain::BBBTrainer drives the same
+ * bbb_draw and the same shared harness the binary does, and the arm's
+ * mathematics has exactly one copy.
  * ===================================================================== */
+#ifndef UNCERTAIN_AS_LIBRARY
 
 int main(int argc, char **argv) {
     if (argc > 1 && argv[1][0] == 'e') return bbb_eval(argc, argv);
@@ -409,3 +417,5 @@ int main(int argc, char **argv) {
     cublasDestroy(cublas_handle);
     return 0;
 }
+
+#endif  // !UNCERTAIN_AS_LIBRARY

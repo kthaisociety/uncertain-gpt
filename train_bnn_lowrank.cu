@@ -94,6 +94,12 @@
 #define NBLOCKS 6      // transformer blocks; override with make L=12
 #endif
 
+// RANK is the rank this BINARY is built at: `make train_bnn_lowrank R=16`.
+// The rank-dependent code below is templated on it rather than reading the
+// macro directly, so the r-loops still unroll into registers (R is a
+// compile-time constant inside each instantiation, exactly as the macro was)
+// while the Python extension can instantiate several ranks and choose one at
+// run time from `rank=`. The macro remains this binary's rank and nothing else.
 #ifndef RANK
 #define RANK 8
 #endif
@@ -110,20 +116,21 @@ typedef struct { size_t poff, aoff, boff; int P; const char *name; } BLayer;
 // w = mu + A z + dvec * eps, elementwise. z lands in shared once per block and
 // every thread broadcast-reads it; A is streamed into registers r at a time
 // (a tile of A would be r times the mu tile and blows the shared budget).
+template <int R>
 __global__ void k_lowrank_sample(float *w, const float *theta, const float *A,
                                  const float *rhod, const float *z,
                                  size_t poff, size_t aoff, size_t boff, int P,
                                  unsigned long long seed, int step) {
-    __shared__ float zs[RANK];
-    if (threadIdx.x < RANK) zs[threadIdx.x] = z[threadIdx.x];
+    __shared__ float zs[R];
+    if (threadIdx.x < R) zs[threadIdx.x] = z[threadIdx.x];
     __syncthreads();
 
     int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i < P) {
         float acc = theta[poff + i];                 // mu
-        const float *Ai = A + aoff + (size_t)i * RANK;   // row-major: r contiguous
+        const float *Ai = A + aoff + (size_t)i * R;   // row-major: r contiguous
         #pragma unroll
-        for (int k = 0; k < RANK; k++) acc += Ai[k] * zs[k];
+        for (int k = 0; k < R; k++) acc += Ai[k] * zs[k];
         // dvec = softplus(rhod), NOT a free parameter — see the header note on
         // why direct dvec blows up under AdamW's scale-free step.
         acc += d_softplus(rhod[boff + i]) * philox_normal(seed, step, poff + i);
@@ -134,20 +141,21 @@ __global__ void k_lowrank_sample(float *w, const float *theta, const float *A,
 //   dL/dmu_i    = dL/dw_i     (already sitting in dw at poff+i — nothing to do)
 //   dL/dA[i][k] = dL/dw_i * z[k]        outer product with the shared z
 //   dL/ddvec_i  = dL/dw_i * eps_i       same eps, regenerated not stored
+template <int R>
 __global__ void k_lowrank_backward(float *dA, float *drhod, const float *dw,
                                    const float *rhod, const float *z,
                                    size_t poff, size_t aoff, size_t boff, int P,
                                    unsigned long long seed, int step) {
-    __shared__ float zs[RANK];
-    if (threadIdx.x < RANK) zs[threadIdx.x] = z[threadIdx.x];
+    __shared__ float zs[R];
+    if (threadIdx.x < R) zs[threadIdx.x] = z[threadIdx.x];
     __syncthreads();
 
     int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i < P) {
         float g = dw[poff + i];
-        float *dAi = dA + aoff + (size_t)i * RANK;
+        float *dAi = dA + aoff + (size_t)i * R;
         #pragma unroll
-        for (int k = 0; k < RANK; k++) dAi[k] += g * zs[k];
+        for (int k = 0; k < R; k++) dAi[k] += g * zs[k];
         // chain through softplus: d(dvec)/d(rhod) = sigmoid(rhod)
         float r = rhod[boff + i];
         drhod[boff + i] += g * philox_normal(seed, step, poff + i) * d_sigmoid(r);
@@ -157,43 +165,45 @@ __global__ void k_lowrank_backward(float *dA, float *drhod, const float *dw,
 // B = D^-1 A, i.e. B[i][k] = A[i][k] / d_i^2. Written into the dA buffer as
 // scratch (it is zeroed immediately afterwards) so no extra P*r allocation.
 // cuBLAS then contracts A^T B into the r x r matrix M - I.
+template <int R>
 __global__ void k_scale_A_dinv(float *B, const float *A, const float *rhod,
                                size_t aoff, size_t boff, int P) {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i < P) {
         float d = d_softplus(rhod[boff + i]);
         float inv = 1.0f / fmaxf(d * d, 1e-20f);
-        const float *Ai = A + aoff + (size_t)i * RANK;
-        float *Bi = B + aoff + (size_t)i * RANK;
+        const float *Ai = A + aoff + (size_t)i * R;
+        float *Bi = B + aoff + (size_t)i * R;
         #pragma unroll
-        for (int k = 0; k < RANK; k++) Bi[k] = Ai[k] * inv;
+        for (int k = 0; k < R; k++) Bi[k] = Ai[k] * inv;
     }
 }
 
 // Add the KL gradients. Minv (r x r) is tiny and goes to shared.
+template <int R>
 __global__ void k_lowrank_kl_grad(float *dtheta, float *dA, float *drhod,
                                   const float *theta, const float *A,
                                   const float *rhod, const float *Minv,
                                   size_t poff, size_t aoff, size_t boff, int P,
                                   float lambda, float weight) {
-    __shared__ float Ms[RANK * RANK];
-    for (int t = threadIdx.x; t < RANK * RANK; t += blockDim.x) Ms[t] = Minv[t];
+    __shared__ float Ms[R * R];
+    for (int t = threadIdx.x; t < R * R; t += blockDim.x) Ms[t] = Minv[t];
     __syncthreads();
 
     int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i < P) {
-        const float *Ai = A + aoff + (size_t)i * RANK;
-        float ar[RANK];
+        const float *Ai = A + aoff + (size_t)i * R;
+        float ar[R];
         #pragma unroll
-        for (int k = 0; k < RANK; k++) ar[k] = Ai[k];
+        for (int k = 0; k < R; k++) ar[k] = Ai[k];
 
         // v = Minv * a_i, then quad = a_i . v
-        float v[RANK], quad = 0.0f;
+        float v[R], quad = 0.0f;
         #pragma unroll
-        for (int k = 0; k < RANK; k++) {
+        for (int k = 0; k < R; k++) {
             float s = 0.0f;
             #pragma unroll
-            for (int j = 0; j < RANK; j++) s += ar[j] * Ms[j * RANK + k];
+            for (int j = 0; j < R; j++) s += ar[j] * Ms[j * R + k];
             v[k] = s;
             quad += ar[k] * s;
         }
@@ -203,9 +213,9 @@ __global__ void k_lowrank_kl_grad(float *dtheta, float *dA, float *drhod,
         float d2  = fmaxf(d * d, 1e-20f);
         float inv = 1.0f / d2;
 
-        float *dAi = dA + aoff + (size_t)i * RANK;
+        float *dAi = dA + aoff + (size_t)i * R;
         #pragma unroll
-        for (int k = 0; k < RANK; k++)
+        for (int k = 0; k < R; k++)
             dAi[k] += weight * (lambda * ar[k] - inv * v[k]);
 
         // lambda*d - 1/d + quad/d^3 : the middle term is mean-field's
@@ -220,6 +230,7 @@ __global__ void k_lowrank_kl_grad(float *dtheta, float *dA, float *drhod,
 
 // Reductions for the KL value and the marginal std sigma_i = sqrt(|A_i|^2+d_i^2),
 // which is what the scorecard's sigma column reports for this arm.
+template <int R>
 __global__ void k_lowrank_stats(float *o_a2, float *o_d2, float *o_logd,
                                 float *o_mu2, float *o_smin, float *o_smax,
                                 float *o_smean, const float *theta,
@@ -230,10 +241,10 @@ __global__ void k_lowrank_stats(float *o_a2, float *o_d2, float *o_logd,
     float smin = 1e30f, smax = -1e30f;
     for (int i = blockDim.x * blockIdx.x + threadIdx.x; i < P;
          i += blockDim.x * gridDim.x) {
-        const float *Ai = A + aoff + (size_t)i * RANK;
+        const float *Ai = A + aoff + (size_t)i * R;
         float rowsq = 0.0f;
         #pragma unroll
-        for (int k = 0; k < RANK; k++) rowsq += Ai[k] * Ai[k];
+        for (int k = 0; k < R; k++) rowsq += Ai[k] * Ai[k];
         float d = d_softplus(rhod[boff + i]), m = theta[poff + i];
         float sig = sqrtf(rowsq + d * d);
         a2 += rowsq; d2 += d * d; logd += logf(fmaxf(d * d, 1e-30f));
@@ -271,44 +282,46 @@ __global__ void k_meanfield_ref(float *w, const float *theta, const float *rhod,
 // z: r draws per layer per step, from a SEPARATE Philox stream so it cannot
 // collide with the per-weight eps stream. Also written to a buffer, so
 // backward reads exactly the forward values (check 5 asserts they agree).
+template <int R>
 __global__ void k_draw_z(float *z, int nbl, unsigned long long seed, int step) {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
-    if (i < nbl * RANK) z[i] = philox_normal(seed, step, i);
+    if (i < nbl * R) z[i] = philox_normal(seed, step, i);
 }
 
 /* ===================================================================== *
  * Host: Cholesky of the r x r M, giving logdet and Minv.
  * ===================================================================== */
+template <int R>
 static int chol_logdet_inv(const float *Min, float *Minv, double *logdet) {
-    float L[RANK * RANK];
+    float L[R * R];
     memcpy(L, Min, sizeof(L));
-    for (int j = 0; j < RANK; j++) {
-        for (int k = 0; k < j; k++) L[j*RANK+j] -= L[j*RANK+k] * L[j*RANK+k];
-        if (L[j*RANK+j] <= 0.0f) return 0;              // not PD
-        L[j*RANK+j] = sqrtf(L[j*RANK+j]);
-        for (int i = j + 1; i < RANK; i++) {
-            for (int k = 0; k < j; k++) L[i*RANK+j] -= L[i*RANK+k] * L[j*RANK+k];
-            L[i*RANK+j] /= L[j*RANK+j];
+    for (int j = 0; j < R; j++) {
+        for (int k = 0; k < j; k++) L[j*R+j] -= L[j*R+k] * L[j*R+k];
+        if (L[j*R+j] <= 0.0f) return 0;              // not PD
+        L[j*R+j] = sqrtf(L[j*R+j]);
+        for (int i = j + 1; i < R; i++) {
+            for (int k = 0; k < j; k++) L[i*R+j] -= L[i*R+k] * L[j*R+k];
+            L[i*R+j] /= L[j*R+j];
         }
-        for (int k = j + 1; k < RANK; k++) L[j*RANK+k] = 0.0f;
+        for (int k = j + 1; k < R; k++) L[j*R+k] = 0.0f;
     }
-    *logdet = 0.0; for (int j = 0; j < RANK; j++) *logdet += 2.0 * log(L[j*RANK+j]);
+    *logdet = 0.0; for (int j = 0; j < R; j++) *logdet += 2.0 * log(L[j*R+j]);
 
-    float Li[RANK * RANK];                               // invert lower triangle
+    float Li[R * R];                               // invert lower triangle
     memset(Li, 0, sizeof(Li));
-    for (int j = 0; j < RANK; j++) {
-        Li[j*RANK+j] = 1.0f / L[j*RANK+j];
-        for (int i = j + 1; i < RANK; i++) {
+    for (int j = 0; j < R; j++) {
+        Li[j*R+j] = 1.0f / L[j*R+j];
+        for (int i = j + 1; i < R; i++) {
             float s = 0.0f;
-            for (int k = j; k < i; k++) s += L[i*RANK+k] * Li[k*RANK+j];
-            Li[i*RANK+j] = -s / L[i*RANK+i];
+            for (int k = j; k < i; k++) s += L[i*R+k] * Li[k*R+j];
+            Li[i*R+j] = -s / L[i*R+i];
         }
     }
-    for (int i = 0; i < RANK; i++)                       // Minv = Li^T Li
-        for (int j = 0; j < RANK; j++) {
+    for (int i = 0; i < R; i++)                       // Minv = Li^T Li
+        for (int j = 0; j < R; j++) {
             float s = 0.0f;
-            for (int k = (i > j ? i : j); k < RANK; k++) s += Li[k*RANK+i] * Li[k*RANK+j];
-            Minv[i*RANK+j] = s;
+            for (int k = (i > j ? i : j); k < R; k++) s += Li[k*R+i] * Li[k*R+j];
+            Minv[i*R+j] = s;
         }
     return 1;
 }
@@ -330,11 +343,11 @@ static int chol_logdet_inv(const float *Min, float *Minv, double *logdet) {
  * eval binary at the rank the checkpoint was trained at.
  * ===================================================================== */
 
-// The same Bayesian-layer list main() builds inline. Kept as a separate
-// function rather than factored out of main(), to keep this change additive
-// while train_bnn_lowrank.cu is being restructured on another branch; the two
-// should be collapsed into one caller once both have landed. If you add a
-// Bayesian layer, change BOTH.
+// THE Bayesian-layer list: which tensors get a posterior, and where their A
+// and dvec live in the packed buffers. One definition, three callers — main(),
+// lowr_eval() and uncertain::LowRankTrainer. Add a Bayesian layer here and all
+// three see it.
+template <int R>
 static size_t lowr_build_layers(BLayer *L, Config cfg) {
     ParamOff po = param_offsets(cfg);
     int C = cfg.C;
@@ -346,7 +359,7 @@ static size_t lowr_build_layers(BLayer *L, Config cfg) {
     }
     size_t Pb = 0;
     for (int l = 0; l < 4 * cfg.L; l++) {
-        L[l].boff = Pb; L[l].aoff = Pb * RANK; Pb += L[l].P;
+        L[l].boff = Pb; L[l].aoff = Pb * R; Pb += L[l].P;
     }
     return Pb;
 }
@@ -356,16 +369,17 @@ typedef struct {
     BLayer *L; int nbl; size_t n;
 } LowRCtx;
 
+template <int R>
 static const float *lowr_draw(int s, void *vctx) {
     LowRCtx *c = (LowRCtx *)vctx;
-    k_draw_z<<<ceil_div(c->nbl * RANK, 128), 128>>>(
+    k_draw_z<R><<<ceil_div(c->nbl * R, 128), 128>>>(
         c->z, c->nbl, UQ_EVAL_SEED ^ 0x9E3779B9ull, s + 1);
     // w = theta everywhere; the four GEMM regions are then overwritten.
     CUDA_CHECK(cudaMemcpy(c->w, c->theta, c->n * sizeof(float),
                           cudaMemcpyDeviceToDevice));
     for (int l = 0; l < c->nbl; l++)
-        k_lowrank_sample<<<ceil_div(c->L[l].P, BS), BS>>>(
-            c->w, c->theta, c->A, c->rhod, c->z + l * RANK,
+        k_lowrank_sample<R><<<ceil_div(c->L[l].P, BS), BS>>>(
+            c->w, c->theta, c->A, c->rhod, c->z + l * R,
             c->L[l].poff, c->L[l].aoff, c->L[l].boff, c->L[l].P,
             UQ_EVAL_SEED, s + 1);
     CUDA_CHECK(cudaGetLastError());
@@ -385,7 +399,7 @@ static int lowr_eval(int argc, char **argv) {
     LowRCtx c;
     c.nbl = 4 * cfg.L;
     c.L   = (BLayer *)malloc(c.nbl * sizeof(BLayer));
-    size_t Pb = lowr_build_layers(c.L, cfg);
+    size_t Pb = lowr_build_layers<RANK>(c.L, cfg);
     c.n = n;
     printf("lowr eval: rank %d, Bayesian over %zu params (%.1f%% — the 4 GEMMs only)\n",
            RANK, Pb, 100.0 * Pb / n);
@@ -412,7 +426,7 @@ static int lowr_eval(int argc, char **argv) {
                     .arm = "lowr", .split = u.split, .mix_label = "mixture",
                     .s_fixed_by_arm = 0, .fixed_batch = 0 };
     UQResult r;
-    int bad = uq_evaluate(&spec, lowr_draw, &c, &ld, d_acts, d_inp, d_tgt,
+    int bad = uq_evaluate(&spec, lowr_draw<RANK>, &c, &ld, d_acts, d_inp, d_tgt,
                           h_inp, h_tgt, h_losses, &r);
     if (!bad) uq_report(&spec, &r);
 
@@ -424,8 +438,13 @@ static int lowr_eval(int argc, char **argv) {
 }
 
 /* ===================================================================== *
- * main
+ * main — compiled out when this file is INCLUDED by the Python extension
+ * (see the note over train_bnn_gpu.cu's main). uncertain::LowRankTrainer
+ * instantiates the templates above at the rank it was asked for and reuses
+ * lowr_draw<R> as its eval callback.
  * ===================================================================== */
+#ifndef UNCERTAIN_AS_LIBRARY
+
 int main(int argc, char **argv) {
     if (argc > 1 && argv[1][0] == 'e') return lowr_eval(argc, argv);
     bool overfit = (argc > 1 && argv[1][0] == 'o');
@@ -441,22 +460,16 @@ int main(int argc, char **argv) {
     ParamOff po = param_offsets(cfg);
     ActOff   a  = act_offsets(cfg);
     size_t n = po.total;
-    int BT = cfg.B * cfg.T, C = cfg.C;
+    int BT = cfg.B * cfg.T;
 
     // the four GEMM matrices, packed
     // four GEMM matrices per block, so NBL = 4 * cfg.L
     const int NBL = 4 * cfg.L;
     BLayer *L = (BLayer *)malloc(NBL * sizeof(BLayer));
-    for (int b = 0; b < cfg.L; b++) {
-        L[4*b+0] = (BLayer){ PBLK(po,b,qw), 0, 0, C * 3 * C, "W_qkv"  };
-        L[4*b+1] = (BLayer){ PBLK(po,b,pw), 0, 0, C * C,     "W_proj" };
-        L[4*b+2] = (BLayer){ PBLK(po,b,w1), 0, 0, C * 4 * C, "W_fc"   };
-        L[4*b+3] = (BLayer){ PBLK(po,b,w2), 0, 0, 4 * C * C, "W_fc2"  };
-    }
-    size_t Pb = 0;
-    for (int l = 0; l < NBL; l++) {
-        L[l].boff = Pb; L[l].aoff = Pb * RANK; Pb += L[l].P;
-    }
+    // Collapsed onto lowr_build_layers, as its comment asked for: the list was
+    // written out twice and "if you add a Bayesian layer, change BOTH" is not a
+    // constraint worth keeping. Same list, same order, same offsets.
+    size_t Pb = lowr_build_layers<RANK>(L, cfg);
 
     const float LAMBDA = 100.0f;                 // prior precision, sigma_p = 0.1
     // DERIVED from the dataset once the loader is up — see train_bnn_gpu.cu's
@@ -504,7 +517,9 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaMalloc(&d_Minv, NBL * RANK * RANK * sizeof(float)));
     float *h_M = (float*)malloc(NBL*RANK*RANK*sizeof(float));
     float *h_Minv = (float*)malloc(NBL*RANK*RANK*sizeof(float));
-    double *logdetM = (double*)malloc(NBL*sizeof(double));
+    // calloc, not malloc: with kl_weight = 0 (overfit mode) nothing ever writes
+    // logdetM, and the stats line below reads it into the printed KL.
+    double *logdetM = (double*)calloc(NBL, sizeof(double));
     CUDA_CHECK(cudaMalloc(&d_inp, BT * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_tgt, BT * sizeof(int)));
 
@@ -547,7 +562,7 @@ int main(int argc, char **argv) {
         printf("CORRECTNESS CHECKS\n------------------\n");
         int fails = 0;
         float *ref = (float *)malloc(pb), *got = (float *)malloc(pb);
-        k_draw_z<<<ceil_div(NBL*RANK,128), 128>>>(d_z, NBL, ZSEED, 1);
+        k_draw_z<RANK><<<ceil_div(NBL*RANK,128), 128>>>(d_z, NBL, ZSEED, 1);
 
         // 2. A = 0 and dvec = 0 -> must reproduce the deterministic model bitwise
         // softplus(-40) underflows to exactly 0, the inverse of dvec = 0
@@ -556,7 +571,7 @@ int main(int argc, char **argv) {
         CUDA_CHECK(cudaMemcpy(d_rhod, h, db, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_w, d_theta, pb, cudaMemcpyDeviceToDevice));
         for (int l = 0; l < NBL; l++)
-            k_lowrank_sample<<<ceil_div(L[l].P, BS), BS>>>(d_w, d_theta, d_A, d_rhod,
+            k_lowrank_sample<RANK><<<ceil_div(L[l].P, BS), BS>>>(d_w, d_theta, d_A, d_rhod,
                 d_z + l * RANK, L[l].poff, L[l].aoff, L[l].boff, L[l].P, SEED, 1);
         CUDA_CHECK(cudaMemcpy(got, d_w, pb, cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(ref, d_theta, pb, cudaMemcpyDeviceToHost));
@@ -572,7 +587,7 @@ int main(int argc, char **argv) {
         CUDA_CHECK(cudaMemcpy(d_w,  d_theta, pb, cudaMemcpyDeviceToDevice));
         CUDA_CHECK(cudaMemcpy(d_dw, d_theta, pb, cudaMemcpyDeviceToDevice));
         for (int l = 0; l < NBL; l++) {
-            k_lowrank_sample<<<ceil_div(L[l].P, BS), BS>>>(d_w, d_theta, d_A, d_rhod,
+            k_lowrank_sample<RANK><<<ceil_div(L[l].P, BS), BS>>>(d_w, d_theta, d_A, d_rhod,
                 d_z + l * RANK, L[l].poff, L[l].aoff, L[l].boff, L[l].P, SEED, 1);
             k_meanfield_ref<<<ceil_div(L[l].P, BS), BS>>>(d_dw, d_theta, d_rhod,
                 L[l].poff, L[l].boff, L[l].P, SEED, 1);
@@ -592,7 +607,7 @@ int main(int argc, char **argv) {
         // 5. eps and z regenerate identically in backward
         float *hz1=(float*)malloc(NBL*RANK*sizeof(float)), *hz2=(float*)malloc(NBL*RANK*sizeof(float));
         CUDA_CHECK(cudaMemcpy(hz1, d_z, NBL*RANK*sizeof(float), cudaMemcpyDeviceToHost));
-        k_draw_z<<<ceil_div(NBL*RANK,128), 128>>>(d_z, NBL, ZSEED, 1);
+        k_draw_z<RANK><<<ceil_div(NBL*RANK,128), 128>>>(d_z, NBL, ZSEED, 1);
         CUDA_CHECK(cudaMemcpy(hz2, d_z, NBL*RANK*sizeof(float), cudaMemcpyDeviceToHost));
         bad = 0; for (int i = 0; i < NBL * RANK; i++) if (hz1[i] != hz2[i]) bad++;
         for (size_t g = L[0].poff; g < L[0].poff + 4096; g++)
@@ -621,7 +636,7 @@ int main(int argc, char **argv) {
                     CUDA_CHECK(cudaMemcpy(d_A, h, (size_t)Pt*RANK*sizeof(float),
                                           cudaMemcpyHostToDevice));
                     CUDA_CHECK(cudaMemcpy(d_w, d_theta, pb, cudaMemcpyDeviceToDevice));
-                    k_lowrank_sample<<<ceil_div(Pt, BS), BS>>>(d_w, d_theta, d_A,
+                    k_lowrank_sample<RANK><<<ceil_div(Pt, BS), BS>>>(d_w, d_theta, d_A,
                         d_rhod, d_z, L[0].poff, 0, 0, Pt, SEED, 1);
                     CUDA_CHECK(cudaMemcpy(got, d_w, pb, cudaMemcpyDeviceToHost));
                     double s2 = 0.0;
@@ -654,9 +669,9 @@ int main(int argc, char **argv) {
             double *mean = (double *)calloc(SUB, sizeof(double));
             double *cov  = (double *)calloc((size_t)SUB * SUB, sizeof(double));
             for (int s = 1; s <= NS; s++) {
-                k_draw_z<<<ceil_div(NBL*RANK,128), 128>>>(d_z, NBL, ZSEED, s);
+                k_draw_z<RANK><<<ceil_div(NBL*RANK,128), 128>>>(d_z, NBL, ZSEED, s);
                 CUDA_CHECK(cudaMemcpy(d_w, d_theta, pb, cudaMemcpyDeviceToDevice));
-                k_lowrank_sample<<<ceil_div(Pt, BS), BS>>>(d_w, d_theta, d_A, d_rhod,
+                k_lowrank_sample<RANK><<<ceil_div(Pt, BS), BS>>>(d_w, d_theta, d_A, d_rhod,
                     d_z, L[0].poff, 0, 0, Pt, SEED, s);
                 CUDA_CHECK(cudaMemcpy(got, d_w + L[0].poff, SUB * sizeof(float),
                                       cudaMemcpyDeviceToHost));
@@ -733,7 +748,7 @@ int main(int argc, char **argv) {
         if (KLW > 0.0f) {
             const float one = 1.0f, zero = 0.0f;
             for (int l = 0; l < NBL; l++) {
-                k_scale_A_dinv<<<ceil_div(L[l].P, BS), BS>>>(d_dA, d_A, d_rhod,
+                k_scale_A_dinv<RANK><<<ceil_div(L[l].P, BS), BS>>>(d_dA, d_A, d_rhod,
                                                   L[l].aoff, L[l].boff, L[l].P);
                 CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T,
                     RANK, RANK, L[l].P, &one, d_dA + L[l].aoff, RANK,
@@ -742,7 +757,7 @@ int main(int argc, char **argv) {
             CUDA_CHECK(cudaMemcpy(h_M, d_M, NBL*RANK*RANK*sizeof(float), cudaMemcpyDeviceToHost));
             for (int l = 0; l < NBL; l++) {
                 for (int j = 0; j < RANK; j++) h_M[l*RANK*RANK + j*RANK + j] += 1.0f;
-                if (!chol_logdet_inv(h_M + l*RANK*RANK, h_Minv + l*RANK*RANK,
+                if (!chol_logdet_inv<RANK>(h_M + l*RANK*RANK, h_Minv + l*RANK*RANK,
                                      &logdetM[l])) {
                     fprintf(stderr, "M not positive definite in layer %s\n", L[l].name);
                     return 1;
@@ -751,12 +766,12 @@ int main(int argc, char **argv) {
             CUDA_CHECK(cudaMemcpy(d_Minv, h_Minv, NBL*RANK*RANK*sizeof(float), cudaMemcpyHostToDevice));
         }
 
-        k_draw_z<<<ceil_div(NBL*RANK,128), 128>>>(d_z, NBL, ZSEED, step);          // one z per layer
+        k_draw_z<RANK><<<ceil_div(NBL*RANK,128), 128>>>(d_z, NBL, ZSEED, step);          // one z per layer
 
         // w = theta everywhere, then the Bayesian regions are overwritten.
         CUDA_CHECK(cudaMemcpy(d_w, d_theta, pb, cudaMemcpyDeviceToDevice));
         for (int l = 0; l < NBL; l++)
-            k_lowrank_sample<<<ceil_div(L[l].P, BS), BS>>>(d_w, d_theta, d_A, d_rhod,
+            k_lowrank_sample<RANK><<<ceil_div(L[l].P, BS), BS>>>(d_w, d_theta, d_A, d_rhod,
                 d_z + l*RANK, L[l].poff, L[l].aoff, L[l].boff, L[l].P, SEED, step);
 
         CUDA_CHECK(cudaMemset(d_dw,    0, pb));
@@ -768,13 +783,13 @@ int main(int argc, char **argv) {
         gpt2_backward(d_dw, d_gacts, d_acts, d_w, d_inp, d_tgt, cfg);
 
         for (int l = 0; l < NBL; l++)
-            k_lowrank_backward<<<ceil_div(L[l].P, BS), BS>>>(d_dA, d_drhod, d_dw,
+            k_lowrank_backward<RANK><<<ceil_div(L[l].P, BS), BS>>>(d_dA, d_drhod, d_dw,
                 d_rhod, d_z + l*RANK, L[l].poff, L[l].aoff, L[l].boff, L[l].P,
                 SEED, step);
 
         if (KLW > 0.0f)
             for (int l = 0; l < NBL; l++)
-                k_lowrank_kl_grad<<<ceil_div(L[l].P, BS), BS>>>(d_dw, d_dA, d_drhod,
+                k_lowrank_kl_grad<RANK><<<ceil_div(L[l].P, BS), BS>>>(d_dw, d_dA, d_drhod,
                     d_theta, d_A, d_rhod, d_Minv + l*RANK*RANK,
                     L[l].poff, L[l].aoff, L[l].boff, L[l].P, LAMBDA, KLW);
 
@@ -790,7 +805,7 @@ int main(int argc, char **argv) {
         if (step == 1 || step % 10 == 0 || step == STEPS) {
             double a2=0, d2=0, logd=0, mu2=0, smean=0; float lo=1e30f, hi=-1e30f;
             for (int l = 0; l < NBL; l++) {
-                k_lowrank_stats<<<SB, BS>>>(dp[0],dp[1],dp[2],dp[3],dp[4],dp[5],dp[6],
+                k_lowrank_stats<RANK><<<SB, BS>>>(dp[0],dp[1],dp[2],dp[3],dp[4],dp[5],dp[6],
                     d_theta, d_A, d_rhod, L[l].poff, L[l].aoff, L[l].boff, L[l].P);
                 for (int q = 0; q < 7; q++)
                     CUDA_CHECK(cudaMemcpy(hp[q], dp[q], SB*sizeof(float),
@@ -823,3 +838,5 @@ int main(int argc, char **argv) {
     printf("\ndone.\n");
     return 0;
 }
+
+#endif  // !UNCERTAIN_AS_LIBRARY

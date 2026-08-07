@@ -72,20 +72,69 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
+/* ---------------------------------------------------------------------------
+ HOW A FATAL ERROR ENDS.
+
+ A standalone trainer that hits a CUDA error has nothing useful left to do, so
+ it prints and exits — unchanged. The same code compiled into the Python
+ extension (uncertain/, which defines UNCERTAIN_AS_LIBRARY) must not kill its
+ host interpreter, so there the same message is printed and then thrown as a
+ std::runtime_error, which pybind turns into a Python exception.
+
+ Every printf is identical in both modes: the binaries' output does not change,
+ and neither does their exit status (EXIT_FAILURE == 1, which is what the
+ loader's exit(1) calls already used).
+--------------------------------------------------------------------------- */
+#ifdef UNCERTAIN_AS_LIBRARY
+#include <stdexcept>
+#define UNCERTAIN_ABORT(msg) throw std::runtime_error(msg)
+#else
+#define UNCERTAIN_ABORT(msg) exit(EXIT_FAILURE)
+#endif
+
 #define CUDA_CHECK(err) cuda_check_((err), __FILE__, __LINE__)
 static void cuda_check_(cudaError_t e, const char *file, int line) {
     if (e != cudaSuccess) {
         printf("[CUDA ERROR] %s:%d  %s\n", file, line, cudaGetErrorString(e));
-        exit(EXIT_FAILURE);
+        UNCERTAIN_ABORT("CUDA error");
     }
 }
 #define CUBLAS_CHECK(st) do { cublasStatus_t s_ = (st); if (s_) { \
     printf("[cuBLAS ERROR] %s:%d  code %d\n", __FILE__, __LINE__, (int)s_); \
-    exit(EXIT_FAILURE);} } while (0)
+    UNCERTAIN_ABORT("cuBLAS error");} } while (0)
 
 static inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
-static cublasHandle_t cublas_handle;
+/* ---------------------------------------------------------------------------
+ THE cuBLAS HANDLE.
+
+ This was a plain `static cublasHandle_t cublas_handle;`. For a one-file binary
+ that is exactly right: one translation unit, one handle, created in main().
+
+ It stops being right the moment two arms are compiled into the same module,
+ which is what the Python extension does. `static` at file scope means INTERNAL
+ linkage: every translation unit that includes this header gets its own private
+ copy. Whichever copy nobody called cublasCreate on stays null, and every GEMM
+ routed through it fails — with nothing in the type system to catch it and no
+ symptom that points here.
+
+ Routing every use through an inline accessor makes it exactly ONE handle per
+ binary or shared object, whatever the translation-unit layout is: C++
+ guarantees a single instance of an inline function's local static across the
+ linked image. The macro keeps every existing call site spelled the same —
+ `cublasCreate(&cublas_handle)`, `cublasDestroy(cublas_handle)`, and the two
+ GEMM wrappers below — so no arm file changes.
+
+ Contract: one handle for the process, on the default stream, shared by every
+ Trainer. See uncertain/SPEC.md for why the extension owns this rather than
+ borrowing PyTorch's handle (that one follows torch's current stream; these
+ kernels launch on the default stream, and mixing the two would race).
+--------------------------------------------------------------------------- */
+inline cublasHandle_t &cublas_handle_ref(void) {
+    static cublasHandle_t h = nullptr;
+    return h;
+}
+#define cublas_handle (cublas_handle_ref())
 
 /* ===================================================================== *
  * Philox 4x32-10 — counter-based RNG.
@@ -845,14 +894,14 @@ typedef struct { int *tokens; long n; long pos; } Loader;
 
 static void loader_init(Loader *ld, const char *path) {
     FILE *f = fopen(path, "rb");
-    if (!f) { printf("cannot open %s\n", path); exit(1); }
+    if (!f) { printf("cannot open %s\n", path); UNCERTAIN_ABORT("loader: cannot open file"); }
     int header[256];
-    if (fread(header, sizeof(int), 256, f) != 256) { printf("bad header\n"); exit(1); }
-    if (header[0] != 20240520) { printf("bad magic %d\n", header[0]); exit(1); }
+    if (fread(header, sizeof(int), 256, f) != 256) { printf("bad header\n"); UNCERTAIN_ABORT("loader: bad header"); }
+    if (header[0] != 20240520) { printf("bad magic %d\n", header[0]); UNCERTAIN_ABORT("loader: bad magic"); }
     long ntok = header[2];
     unsigned short *raw = (unsigned short *)malloc(ntok * sizeof(unsigned short));
     if (fread(raw, sizeof(unsigned short), ntok, f) != (size_t)ntok) {
-        printf("short read\n"); exit(1);
+        printf("short read\n"); UNCERTAIN_ABORT("loader: short read");
     }
     fclose(f);
     ld->tokens = (int *)malloc(ntok * sizeof(int));
@@ -1038,13 +1087,13 @@ static int ckpt_load(const char *arm, const char *what, float *d_buf,
 // 1 KB of header beats re-reading 90M tokens to learn one integer.
 static long loader_count(const char *path) {
     FILE *f = fopen(path, "rb");
-    if (!f) { printf("cannot open %s\n", path); exit(1); }
+    if (!f) { printf("cannot open %s\n", path); UNCERTAIN_ABORT("loader_count: cannot open file"); }
     int header[256];
     if (fread(header, sizeof(int), 256, f) != 256) {
-        printf("bad header in %s\n", path); exit(1);
+        printf("bad header in %s\n", path); UNCERTAIN_ABORT("loader_count: bad header");
     }
     fclose(f);
-    if (header[0] != 20240520) { printf("bad magic %d in %s\n", header[0], path); exit(1); }
+    if (header[0] != 20240520) { printf("bad magic %d in %s\n", header[0], path); UNCERTAIN_ABORT("loader_count: bad magic"); }
     return header[2];
 }
 
@@ -1054,7 +1103,7 @@ static const char *uq_split_path(const char *split) {
     if (strcmp(split, "val")  == 0) return DATA_VAL;
     if (strcmp(split, "test") == 0) return DATA_TEST;
     printf("unknown split '%s' — use 'val' or 'test'\n", split);
-    exit(1);
+    UNCERTAIN_ABORT("unknown split");
 }
 
 #define UQ_BINS 15

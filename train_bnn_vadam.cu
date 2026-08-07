@@ -216,7 +216,12 @@ static int vadam_eval(int argc, char **argv) {
 
 /* ===================================================================== *
  * main — same shape as the BBB main, minus everything Vadam deleted.
+ *
+ * Compiled out when this file is INCLUDED by the Python extension
+ * (see the note over train_bnn_gpu.cu's main). vadam_draw above is shared
+ * with uncertain::VadamTrainer unchanged.
  * ===================================================================== */
+#ifndef UNCERTAIN_AS_LIBRARY
 
 int main(int argc, char **argv) {
     if (argc > 1 && argv[1][0] == 'e') return vadam_eval(argc, argv);
@@ -397,3 +402,5 @@ int main(int argc, char **argv) {
     cublasDestroy(cublas_handle);
     return 0;
 }
+
+#endif  // !UNCERTAIN_AS_LIBRARY

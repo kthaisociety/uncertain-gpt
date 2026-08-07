@@ -13,6 +13,12 @@
 !*.py
 !*.md
 !*.svg
+!*.toml
+
+# ...and the Python extension's build output, which is not authored either.
+build/
+*.egg-info/
+*.so
 
 # ...except these, which are downloaded or generated, not authored.
 .venv/

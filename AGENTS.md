@@ -38,6 +38,35 @@ Two invariants worth knowing before touching it:
 reference. If a refactor changes any number it prints, that is a bug in the
 refactor.
 
+## The Python package (`uncertain/`)
+
+`pip install -e . --no-build-isolation` compiles `uncertain/_C.cu` into
+`uncertain._C`. That file `#include`s the four arm `.cu` files verbatim into ONE
+translation unit and lifts what used to be their `main()`s into classes; it
+implements no kernel, no optimizer and no metric of its own. Full API, design
+rationale and verification checklist: `SPEC.md`.
+
+Three conventions the package depends on. Break any of them and the binaries
+still build while the module breaks, or worse, does not:
+
+- **`main()` lives inside `#ifndef UNCERTAIN_AS_LIBRARY`.** Four `main()`
+  symbols cannot coexist in one module. A NEW ARM must wrap its `main()` the
+  same way and leave everything else — kernels, its `uq_sample_fn` — outside the
+  guard, so the extension gets the arm's mathematics with no second copy.
+- **Reach cuBLAS only through the `cublas_handle` macro.** It expands to an
+  inline accessor's local static, which is one handle per linked image whatever
+  the translation-unit layout. A plain `static` at file scope silently gives
+  every TU its own null copy.
+- **Fatal paths go through `UNCERTAIN_ABORT`,** which is `exit()` in a binary
+  and `throw` in the module. A bare `exit()` in shared code kills the user's
+  Python interpreter.
+
+Building it needs an `nvcc` whose CUDA MAJOR version matches the one torch was
+built against (`torch.version.cuda`) — torch refuses the build otherwise, and it
+is right to. The system `nvcc` is not necessarily that one. `make NVCC=<path>`
+builds the binaries with the same toolchain, which is what a timing comparison
+against the wrapper requires.
+
 ## Sharp edges
 
 - **Derive constants, don't type them.** The ELBO's KL weight is `1/N` from the
@@ -46,8 +75,17 @@ refactor.
 - **Vadam's sigma hides `N`.** `sigma = 1/sqrt(N*s + lambda)` uses the TRAINING
   token count, so evaluating on val/test still needs `DATA_TRAIN`'s N — see
   `loader_count`.
-- **Low-rank `RANK` is compile-time.** Build the binary at the rank the
-  checkpoint was trained at; `ckpt_load`'s element-count check catches mismatch.
+- **Low-rank rank is compile-time.** The rank-dependent code is templated on
+  `R` so the r-loops unroll; the binary instantiates the `RANK` macro and the
+  Python module instantiates a fixed list (`UNCERTAIN_LOWRANK_RANKS`). Either
+  way, evaluate a checkpoint at the rank it was trained at — `ckpt_load`'s
+  element-count check catches the mismatch.
+- **Two things are not bit-reproducible; do not chase them as regressions.**
+  `./train_bnn_lowrank check` fails check 2 on `main` itself (pre-existing, worth
+  a real investigation, not caused by any refactor that reproduces it). And
+  `overfit` runs diverge from themselves run to run — a last-bit difference
+  amplifies in a steeply falling loss — so compare final nll and shape, not
+  digits. Normal-mode runs ARE reproducible and are the regression check to use.
 - `scorecard.c` parses stdout by format string (`step %d | nll %f | ...` and
   `summary:` lines, first 3 only). Changing those formats breaks the scorecard.
 - `paper/tables/make_tables.py` parses the SAME two formats plus the `eval:`

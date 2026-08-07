@@ -155,6 +155,13 @@ static int ens_eval(int argc, char **argv) {
     return bad;
 }
 
+/* ===================================================================== *
+ * main — compiled out when this file is INCLUDED by the Python extension
+ * (see the note over train_bnn_gpu.cu's main). ens_draw above is shared with
+ * uncertain::EnsembleTrainer unchanged.
+ * ===================================================================== */
+#ifndef UNCERTAIN_AS_LIBRARY
+
 int main(int argc, char **argv) {
     if (argc > 1 && argv[1][0] == 'e') return ens_eval(argc, argv);
     bool overfit = (argc > 1 && argv[1][0] == 'o');
@@ -313,3 +320,5 @@ int main(int argc, char **argv) {
     cublasDestroy(cublas_handle);
     return 0;
 }
+
+#endif  // !UNCERTAIN_AS_LIBRARY
