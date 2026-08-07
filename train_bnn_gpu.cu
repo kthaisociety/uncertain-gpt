@@ -13,6 +13,10 @@
  Build:   make train_bnn_gpu
  Run:     ./train_bnn_gpu            train on TinyShakespeare
           ./train_bnn_gpu overfit    memorize one batch (the smoke test)
+          ./train_bnn_gpu eval [steps] [S] [batches] [split]
+                                     NLPD / ECE / aleatoric-epistemic-total
+                                     from a SAVED checkpoint, on held-out
+                                     val or test. Never trains.
 
 -----------------------------------------------------------------------------
  WHAT THIS COSTS, AND WHY IT IS THE THING TO BEAT
@@ -147,10 +151,74 @@ __global__ void k_kl_stats(float *kl_part, float *sig_part,
 
 
 /* ===================================================================== *
+ * eval — uncertainty from a SAVED checkpoint, no training.
+ *
+ *     ./train_bnn_gpu eval [steps] [S] [batches] [split]
+ *
+ * The arm's whole contribution to the shared harness is one callback: draw
+ * s is one reparameterized sample w = mu + softplus(rho) * eps, i.e. the
+ * training sampler with the step index replaced by the sample index. From
+ * there gpt2_kernels.cuh does exactly what it does for the other three.
+ * ===================================================================== */
+typedef struct { float *w, *mu, *rho; size_t n; int grid; } BBBCtx;
+
+static const float *bbb_draw(int s, void *vctx) {
+    BBBCtx *c = (BBBCtx *)vctx;
+    // step = s+1 on the eval seed: S independent draws, from a Philox stream
+    // no training step ever consumed.
+    k_bayes_sample<<<c->grid, BS>>>(c->w, c->mu, c->rho, c->n, UQ_EVAL_SEED, s + 1);
+    CUDA_CHECK(cudaGetLastError());
+    return c->w;
+}
+
+static int bbb_eval(int argc, char **argv) {
+    if (uq_selftest()) return 1;
+    UQArgs u = uq_parse_args(argc, argv);
+    CUBLAS_CHECK(cublasCreate(&cublas_handle));
+
+    Config cfg = { .B = 4, .T = 64, .C = 384, .V = VOCAB, .NH = 6, .maxT = 1024, .L = NBLOCKS };
+    ParamOff p = param_offsets(cfg);
+    ActOff   a = act_offsets(cfg);
+    size_t n = p.total, pb = n * sizeof(float);
+    int BT = cfg.B * cfg.T;
+
+    BBBCtx c; c.n = n; c.grid = ceil_div((int)n, BS);
+    CUDA_CHECK(cudaMalloc(&c.mu, pb));
+    CUDA_CHECK(cudaMalloc(&c.rho, pb));
+    CUDA_CHECK(cudaMalloc(&c.w, pb));
+    if (ckpt_load("bbb", "mu",  c.mu,  n, cfg, u.steps) < 0) return 1;
+    if (ckpt_load("bbb", "rho", c.rho, n, cfg, u.steps) < 0) return 1;
+
+    float *d_acts; int *d_inp, *d_tgt;
+    CUDA_CHECK(cudaMalloc(&d_acts, a.total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_inp, BT * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_tgt, BT * sizeof(int)));
+    int   *h_inp    = (int *)malloc(BT * sizeof(int));
+    int   *h_tgt    = (int *)malloc(BT * sizeof(int));
+    float *h_losses = (float *)malloc(BT * sizeof(float));
+
+    Loader ld; loader_init(&ld, uq_split_path(u.split));
+    UQSpec spec = { .cfg = cfg, .S = u.S, .nbatches = u.nbatches,
+                    .arm = "bbb", .split = u.split, .mix_label = "mixture",
+                    .s_fixed_by_arm = 0, .fixed_batch = 0 };
+    UQResult r;
+    int bad = uq_evaluate(&spec, bbb_draw, &c, &ld, d_acts, d_inp, d_tgt,
+                          h_inp, h_tgt, h_losses, &r);
+    if (!bad) uq_report(&spec, &r);
+
+    free(h_inp); free(h_tgt); free(h_losses); free(ld.tokens);
+    cudaFree(c.mu); cudaFree(c.rho); cudaFree(c.w);
+    cudaFree(d_acts); cudaFree(d_inp); cudaFree(d_tgt);
+    cublasDestroy(cublas_handle);
+    return bad;
+}
+
+/* ===================================================================== *
  * main
  * ===================================================================== */
 
 int main(int argc, char **argv) {
+    if (argc > 1 && argv[1][0] == 'e') return bbb_eval(argc, argv);
     bool overfit = (argc > 1 && argv[1][0] == 'o');
 
     cudaDeviceProp prop;

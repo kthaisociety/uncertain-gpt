@@ -29,18 +29,27 @@
      p_bar(y|x) = (1/E) sum_e softmax(logits_e)
  A logit average is a geometric mean — not a mixture, wrong uncertainty.
 
- UNCERTAINTY DECOMPOSITION (per token, nats, double precision):
+ UNCERTAINTY DECOMPOSITION — now in gpt2_kernels.cuh, shared by all four
+ arms as "S samples from a per-arm sample_fn". It was written here, and
+ this file is still the reference implementation; it moved because three
+ of four arms produced no uncertainty numbers while it lived here.
+
      total     = H[p_bar]
-     aleatoric = (1/E) sum_e H[p_e]
-     epistemic = (1/E) sum_e KL(p_e || p_bar)
+     aleatoric = (1/S) sum_s H[p_s]
+     epistemic = (1/S) sum_s KL(p_s || p_bar)
+
  total = aleatoric + epistemic is an exact identity; it is ASSERTED at
- 1e-5 and the run exits nonzero if it fails. Epistemic — member
- disagreement — is the analogue of the BNN's predictive variance.
+ 1e-5 and the run exits nonzero if it fails — for every arm now, not just
+ this one. Epistemic — sample disagreement — is the analogue of the BNN's
+ predictive variance.
 
  FAIR-COMPARISON NOTE: the BNN arms use S Monte Carlo forward passes at
  eval; with S = E = 5 the inference FLOPs are identical across arms. Where
  the ensemble pays is MEMORY (E x params — worst of all arms) and TRAIN
- COST (E x steps).
+ COST (E x steps). And S IS NOT FREE HERE: this arm's S is pinned to the
+ number of members it trained, while the Bayesian arms buy an extra sample
+ for one forward pass. The harness prints that asymmetry rather than
+ quietly evaluating the arms at different S.
 
  Deviations from the full spec, deliberate at this scale:
    - members live in VRAM, no checkpoint files (5 x 340 MB fits; seeds are
@@ -53,6 +62,10 @@
  Build:   make train_ensemble
  Run:     ./train_ensemble            train E members, then evaluate
           ./train_ensemble overfit    E members memorize the same batch
+          ./train_ensemble eval [steps] [S] [batches] [split]
+                                      uncertainty from SAVED members, on
+                                      held-out val/test. No training. S is
+                                      ignored (see the note above).
 =============================================================================
 */
 
@@ -66,75 +79,84 @@
 static const int SEEDS[E_MEMBERS] = { 1337, 2337, 3337, 4337, 5337 };
 
 /* ===================================================================== *
- * Host-side evaluation: consumes E prob buffers for one batch, accumulates
- * NLPD / ECE / the three uncertainty terms. All math in double — the
- * identity check at 1e-5 is only meaningful if the arithmetic is cleaner
- * than the tolerance.
+ * The uncertainty decomposition MOVED to gpt2_kernels.cuh (uq_fold_batch /
+ * uq_evaluate / uq_report). It was written here and it is still the
+ * reference, but three of four arms could not reach it while it lived in
+ * this file. Generalizing "E members" to "S samples from a sample_fn" is
+ * the whole change: pass S = E and the arithmetic is identical term for
+ * term, so the control arm's numbers are fixed by construction.
+ *
+ * The ensemble's sample_fn is the degenerate one — sample e IS member e,
+ * already in VRAM, so it hands back a pointer and copies nothing.
  * ===================================================================== */
-typedef struct {
-    double nlpd_ens, nlpd_single;      // sums over positions
-    double total, alea, epi;           // sums over positions
-    double id_err_max;                 // worst |total-(alea+epi)| seen
-    // ECE, 15 bins on confidence = max_y p_bar
-    double bin_conf[15], bin_acc[15]; long bin_n[15];
-    long npos;
-} EvalAcc;
+typedef struct { const float *member[E_MEMBERS]; } EnsCtx;
 
-static void eval_batch(EvalAcc *acc, float **probs /*E x BT*V*/, const int *tgt,
-                       int BT, int V, double *pbar /*V scratch*/, int with_nlpd) {
-    for (int p = 0; p < BT; p++) {
-        // p_bar: mixture of the E members, in double
-        for (int y = 0; y < V; y++) pbar[y] = 0.0;
-        for (int e = 0; e < E_MEMBERS; e++) {
-            const float *pe = probs[e] + (size_t)p * V;
-            for (int y = 0; y < V; y++) pbar[y] += pe[y];
-        }
-        double h_bar = 0.0;
-        int argmax = 0;
-        for (int y = 0; y < V; y++) {
-            pbar[y] /= E_MEMBERS;
-            if (pbar[y] > 0.0) h_bar -= pbar[y] * log(pbar[y]);
-            if (pbar[y] > pbar[argmax]) argmax = y;
-        }
+static const float *ens_draw(int s, void *vctx) {
+    return ((EnsCtx *)vctx)->member[s];   // no sampling: this arm has no posterior
+}
 
-        // aleatoric = mean member entropy; epistemic = mean KL(p_e || p_bar),
-        // computed DIRECTLY (not as the difference) so the identity check
-        // below actually tests something.
-        double h_mean = 0.0, kl_mean = 0.0;
-        for (int e = 0; e < E_MEMBERS; e++) {
-            const float *pe = probs[e] + (size_t)p * V;
-            double h = 0.0, kl = 0.0;
-            for (int y = 0; y < V; y++) {
-                double q = pe[y];
-                if (q > 0.0) {
-                    double lq = log(q);
-                    h  -= q * lq;
-                    kl += q * (lq - log(pbar[y]));
-                }
-            }
-            h_mean += h; kl_mean += kl;
-        }
-        h_mean /= E_MEMBERS; kl_mean /= E_MEMBERS;
+/* ===================================================================== *
+ * eval mode — uncertainty numbers from the SAVED members, no training.
+ *
+ *     ./train_ensemble eval [steps] [S] [batches] [split]
+ *
+ * S is accepted for CLI symmetry with the other three arms and then
+ * ignored, loudly: this arm's S is E_MEMBERS and cannot be raised without
+ * paying for another full training run. That asymmetry is the honest cost
+ * of the control arm and it is printed rather than hidden.
+ * ===================================================================== */
+static int ens_eval(int argc, char **argv) {
+    if (uq_selftest()) return 1;
+    UQArgs u = uq_parse_args(argc, argv);
+    if (u.S != E_MEMBERS)
+        printf("note: S is FIXED at %d for this arm (one sample per trained member);\n"
+               "      the requested S=%d is ignored. The Bayesian arms can draw any S\n"
+               "      from a posterior for the price of a forward pass; this one cannot\n"
+               "      exceed the members it paid to train. Report that asymmetry.\n",
+               E_MEMBERS, u.S);
 
-        double id_err = fabs(h_bar - (h_mean + kl_mean));
-        if (id_err > acc->id_err_max) acc->id_err_max = id_err;
+    CUBLAS_CHECK(cublasCreate(&cublas_handle));
+    Config cfg = { .B = 4, .T = 64, .C = 384, .V = VOCAB, .NH = 6, .maxT = 1024, .L = NBLOCKS };
+    ParamOff po = param_offsets(cfg);
+    ActOff   a  = act_offsets(cfg);
+    size_t n = po.total, pb = n * sizeof(float);
+    int BT = cfg.B * cfg.T;
 
-        acc->total += h_bar; acc->alea += h_mean; acc->epi += kl_mean;
-
-        if (with_nlpd) {
-            int y = tgt[p];
-            acc->nlpd_ens    -= log(fmax(pbar[y], 1e-30));
-            acc->nlpd_single -= log(fmax((double)probs[0][(size_t)p * V + y], 1e-30));
-            int b = (int)(pbar[argmax] * 15.0); if (b > 14) b = 14;
-            acc->bin_conf[b] += pbar[argmax];
-            acc->bin_acc[b]  += (argmax == y) ? 1.0 : 0.0;
-            acc->bin_n[b]++;
-        }
-        acc->npos++;
+    EnsCtx ec;
+    float *d_member[E_MEMBERS];
+    for (int e = 0; e < E_MEMBERS; e++) {
+        char w[32]; snprintf(w, sizeof w, "member%d", e);
+        CUDA_CHECK(cudaMalloc(&d_member[e], pb));
+        if (ckpt_load("ens", w, d_member[e], n, cfg, u.steps) < 0) return 1;
+        ec.member[e] = d_member[e];
     }
+
+    float *d_acts; int *d_inp, *d_tgt;
+    CUDA_CHECK(cudaMalloc(&d_acts, a.total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_inp, BT * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_tgt, BT * sizeof(int)));
+    int   *h_inp    = (int *)malloc(BT * sizeof(int));
+    int   *h_tgt    = (int *)malloc(BT * sizeof(int));
+    float *h_losses = (float *)malloc(BT * sizeof(float));
+
+    Loader ld; loader_init(&ld, uq_split_path(u.split));
+    UQSpec spec = { .cfg = cfg, .S = E_MEMBERS, .nbatches = u.nbatches,
+                    .arm = "ens", .split = u.split, .mix_label = "ensemble",
+                    .s_fixed_by_arm = 1, .fixed_batch = 0 };
+    UQResult r;
+    int bad = uq_evaluate(&spec, ens_draw, &ec, &ld, d_acts, d_inp, d_tgt,
+                          h_inp, h_tgt, h_losses, &r);
+    if (!bad) uq_report(&spec, &r);
+
+    free(h_inp); free(h_tgt); free(h_losses); free(ld.tokens);
+    for (int e = 0; e < E_MEMBERS; e++) cudaFree(d_member[e]);
+    cudaFree(d_acts); cudaFree(d_inp); cudaFree(d_tgt);
+    cublasDestroy(cublas_handle);
+    return bad;
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && argv[1][0] == 'e') return ens_eval(argc, argv);
     bool overfit = (argc > 1 && argv[1][0] == 'o');
 
     cudaDeviceProp prop;
@@ -147,7 +169,7 @@ int main(int argc, char **argv) {
     ParamOff po = param_offsets(cfg);
     ActOff   a  = act_offsets(cfg);
     size_t n = po.total;
-    int BT = cfg.B * cfg.T, V = cfg.V;
+    int BT = cfg.B * cfg.T;   // V now lives in the shared harness's UQSpec.cfg
 
     const float LR = overfit ? 1e-3f : 1e-4f;   // same policy as the other arms
     const float B1 = 0.9f, B2 = 0.999f, AEPS = 1e-8f, WD = 0.0f;
@@ -243,77 +265,40 @@ int main(int argc, char **argv) {
     }
 
     /* ---- ensemble evaluation ---------------------------------------------
-       Batch by batch: run all E members on the same inputs, pull their prob
-       rows to the host, fold into the accumulator. p_bar / H / KL in double. */
-    float *h_probs[E_MEMBERS];
-    for (int e = 0; e < E_MEMBERS; e++)
-        h_probs[e] = (float *)malloc((size_t)BT * V * sizeof(float));
-    double *pbar = (double *)malloc((size_t)V * sizeof(double));
-    EvalAcc id_acc  = {0}, ood_acc = {0};
+       Now the SHARED path (gpt2_kernels.cuh), with S = E_MEMBERS. Same batch
+       order, same member order, same double-precision folding, same OOD seed
+       — so every number this block printed before, it prints now.
+
+       The split here is deliberately NOT DATA_VAL: this is the in-training
+       eval, and its job is to stay byte-comparable with every run already in
+       runs/results.csv. It reads the training file past the tokens training
+       consumed (overfit re-reads its one memorized batch). For the val/test
+       numbers the four-arm comparison is built on, use `./train_ensemble eval`. */
+    EnsCtx ec;
+    for (int e = 0; e < E_MEMBERS; e++) ec.member[e] = d_member[e];
 
     // Held-out: text the training never reached (training consumed the first
     // STEPS*BT tokens; overfit consumed one batch and evaluates on it).
     if (!overfit) ld.pos = (long)STEPS * BT;
-    for (int b = 0; b < EVAL_BATCHES; b++) {
-        if (!overfit) {
-            loader_next(&ld, h_inp, h_tgt, BT);
-            CUDA_CHECK(cudaMemcpy(d_inp, h_inp, BT * sizeof(int), cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(d_tgt, h_tgt, BT * sizeof(int), cudaMemcpyHostToDevice));
-        }
-        for (int e = 0; e < E_MEMBERS; e++) {
-            gpt2_forward(d_acts, d_member[e], d_inp, d_tgt, cfg, h_losses);
-            CUDA_CHECK(cudaMemcpy(h_probs[e], d_acts + a.prb,
-                                  (size_t)BT * V * sizeof(float), cudaMemcpyDeviceToHost));
-        }
-        eval_batch(&id_acc, h_probs, h_tgt, BT, V, pbar, 1);
-    }
-
-    // OOD: uniform-random token ids. Not another text domain — a direction:
-    // member disagreement must RISE out here or the ensemble is not
-    // capturing model uncertainty.
-    srand(99991);
-    for (int b = 0; b < EVAL_BATCHES; b++) {
-        for (int i = 0; i < BT; i++) { h_inp[i] = rand() % V; h_tgt[i] = rand() % V; }
-        CUDA_CHECK(cudaMemcpy(d_inp, h_inp, BT * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_tgt, h_tgt, BT * sizeof(int), cudaMemcpyHostToDevice));
-        for (int e = 0; e < E_MEMBERS; e++) {
-            gpt2_forward(d_acts, d_member[e], d_inp, d_tgt, cfg, h_losses);
-            CUDA_CHECK(cudaMemcpy(h_probs[e], d_acts + a.prb,
-                                  (size_t)BT * V * sizeof(float), cudaMemcpyDeviceToHost));
-        }
-        eval_batch(&ood_acc, h_probs, h_tgt, BT, V, pbar, 0);
-    }
-
-    // ---- report -----------------------------------------------------------
-    double np = (double)id_acc.npos;
-    double ece = 0.0;
-    for (int b = 0; b < 15; b++)
-        if (id_acc.bin_n[b])
-            ece += fabs(id_acc.bin_acc[b] - id_acc.bin_conf[b]) / np;
-
-    double epi_id  = id_acc.epi  / np;
-    double epi_ood = ood_acc.epi / (double)ood_acc.npos;
-
-    // The correctness gate of this file: total = aleatoric + epistemic.
-    if (id_acc.id_err_max > 1e-5 || ood_acc.id_err_max > 1e-5) {
-        fprintf(stderr, "IDENTITY VIOLATION: |total-(alea+epi)| = %.2e (tol 1e-5)\n",
-                fmax(id_acc.id_err_max, ood_acc.id_err_max));
-        return 1;
-    }
+    UQSpec spec = { .cfg = cfg, .S = E_MEMBERS, .nbatches = EVAL_BATCHES,
+                    .arm = "ens",
+                    .split = overfit ? "train[the one memorized batch]"
+                                     : "train[tail, past what training read]",
+                    .mix_label = "ensemble", .s_fixed_by_arm = 1,
+                    .fixed_batch = overfit };
+    UQResult r;
+    // The correctness gate of this file, now shared by all four arms.
+    if (uq_evaluate(&spec, ens_draw, &ec, &ld, d_acts, d_inp, d_tgt,
+                    h_inp, h_tgt, h_losses, &r) != 0) return 1;
 
     printf("\nsummary: E=%d, S=E so inference FLOPs match the BNN arms | member mem %d x params\n",
            E_MEMBERS, E_MEMBERS);
-    printf("summary: NLPD single %.4f -> ensemble %.4f | ECE(15) %.4f | identity_err %.1e\n",
-           id_acc.nlpd_single / np, id_acc.nlpd_ens / np, ece,
-           fmax(id_acc.id_err_max, ood_acc.id_err_max));
-    printf("summary: uncertainty (nats)  ID: total %.3f = alea %.3f + epi %.4f   OOD: epi %.4f  %s\n",
-           id_acc.total / np, id_acc.alea / np, epi_id, epi_ood,
-           epi_ood > epi_id ? "(OOD > ID, as required)" : "(WARN: OOD <= ID!)");
+    uq_report(&spec, &r);
 
     // final standard step line: the scorecard's "last nll" for this arm is
     // the ENSEMBLE NLPD — the number the arm actually competes on.
     printf("step %4d | nll %8.4f | kl        0.0 | sigma 0.000000 [0.000000, 0.000000] |    0.00 ms\n",
-           STEPS, id_acc.nlpd_ens / np);
+           STEPS, r.nlpd_mix);
 
     if (!overfit)
         for (int e = 0; e < E_MEMBERS; e++) {
@@ -321,8 +306,8 @@ int main(int argc, char **argv) {
             ckpt_save("ens", w, d_member[e], n, cfg, STEPS);
         }
     printf("\ndone.\n");
-    for (int e = 0; e < E_MEMBERS; e++) { free(h_probs[e]); cudaFree(d_member[e]); }
-    free(pbar); free(h_inp); free(h_tgt); free(h_losses); free(h_par); free(ld.tokens);
+    for (int e = 0; e < E_MEMBERS; e++) cudaFree(d_member[e]);
+    free(h_inp); free(h_tgt); free(h_losses); free(h_par); free(ld.tokens);
     cudaFree(d_m); cudaFree(d_v); cudaFree(d_dw);
     cudaFree(d_acts); cudaFree(d_gacts); cudaFree(d_inp); cudaFree(d_tgt);
     cublasDestroy(cublas_handle);

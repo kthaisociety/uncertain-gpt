@@ -63,13 +63,26 @@ Ens5      ~1.0 GB    13.05 ms/step per member, x5
 
 ## THE OPEN WORK, in priority order
 
-1. **Shared eval harness.** The biggest gap. Only Ens5 computes NLPD / ECE /
-   aleatoric-epistemic-total. Three of four arms produce NO uncertainty
-   numbers, so the comparison currently cannot answer the question the
-   control arm exists to answer. Move the decomposition out of
-   train_ensemble.cu into gpt2_kernels.cuh, generalize from "E members" to
-   "S samples from a per-arm sample_fn", and point it at DATA_VAL — which is
-   still unused. It must run against the SAVED CHECKPOINTS, not retrain.
+1. ~~**Shared eval harness.**~~ WRITTEN, NEVER EXECUTED (branch
+   `fm/ug-eval-harness`, authored while the card was out for service). The
+   decomposition now lives in gpt2_kernels.cuh as "S samples from a per-arm
+   sample_fn"; all four arms have an `eval` mode that loads a checkpoint and
+   reports NLPD / ECE / aleatoric-epistemic-total on DATA_VAL or DATA_TEST:
+
+   ```bash
+   ./train_bnn_gpu     eval 100000 8 64 val
+   ./train_bnn_vadam   eval 100000 8 64 val
+   ./train_bnn_lowrank eval 100000 8 64 val     # build at the ckpt's rank
+   ./train_ensemble    eval 100000            # S fixed at E=5
+   ```
+
+   NOT ONE LINE OF IT HAS BEEN COMPILED OR RUN. First job when the GPU is
+   back: `make` all four, then `./train_ensemble train 100000` and diff its
+   summary lines against runs/Ens5_*.log — they must be identical, since the
+   refactor is supposed to change nothing the control arm prints.
+
+   Only BBB and Vadam have checkpoints, so only those two can be evaluated
+   today; Ens5 and LowR8 need their training runs finished first (see above).
 
 2. **Two unvalidated code paths.**
    - The L>1 block loop has no CPU reference (train_bnn.c is one block). Only
