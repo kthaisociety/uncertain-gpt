@@ -23,62 +23,49 @@ A GPT-2 \citep{radford2019language} of the usual pre-LayerNorm transformer
 shape \citep{vaswani2017attention}: width $C = 384$, $6$ heads, $6$ blocks,
 vocabulary $V = 27$, maximum context $1024$, trained at sequence length
 $T = 64$ and batch $B = 4$. That is $11{,}061{,}531$ parameters, of which the
-six transformer blocks hold about $96\%$. The small vocabulary is the reason:
-at GPT-2's BPE vocabulary the token embedding alone would dominate the
-parameter count and the logit activations, and the experiment would be about
-an embedding table. Attention uses the IO-aware formulation of
-\citet{dao2022flashattention}, so no $(B, \mathrm{NH}, T, T)$ score buffer is
-ever allocated. The deterministic scaffolding --- data format, loader,
-reference implementation --- follows llm.c \citep{karpathy2024llmc} and
-nanoGPT \citep{karpathy2022nanogpt}.
+six transformer blocks hold about $96\%$. Attention uses the IO-aware
+formulation of \citet{dao2022flashattention}, so no $(B, \mathrm{NH}, T, T)$
+score buffer is allocated. Data format, loader and reference implementation
+follow llm.c \citep{karpathy2024llmc} and nanoGPT \citep{karpathy2022nanogpt}.
 
 \paragraph{Data.}
 text8 \citep{mahoney2011text8}, character-level over $27$ symbols (lowercase
 \texttt{a}--\texttt{z} plus space), in the standard split: the first $90$M
-tokens for training, the next $5$M for validation, the last $5$M for test.
-The loader walks the corpus sequentially and hands out $B \cdot T = 256$
-contiguous tokens per step; there is no shuffling and no bagging, so every
-arm sees the same tokens in the same order. Each arm trained for $100{,}000$
-steps, which is $25.6$M tokens, or $28\%$ of the training split.
+tokens for training, the next $5$M for validation, the last $5$M for test. The
+loader walks the corpus sequentially and hands out $B \cdot T = 256$ contiguous
+tokens per step, so every arm sees the same tokens in the same order. Each arm
+trained for $100{,}000$ steps, or $25.6$M tokens.
 
 \paragraph{Hardware and precision.}
-One RTX 2060 Max-Q, compute capability \texttt{sm\_75}, $6$\,GB of VRAM,
-fp32 throughout. The four GEMMs per block go through cuBLAS; everything else
-is a hand-written kernel. Each kernel was developed and benchmarked on its
-own in \texttt{dev/} and checked against the single-threaded C reference
-implementation before being brought into the shared header.
+One RTX 2060 Max-Q, compute capability \texttt{sm\_75}, $6$\,GB of VRAM, fp32
+throughout. The four GEMMs per block go through cuBLAS; every other kernel is
+hand-written, benchmarked in \texttt{dev/} and checked against the
+single-threaded C reference.
 
 \paragraph{Optimiser and RNG.}
-AdamW \citep{kingma2015adam,loshchilov2019adamw} in every arm, with the same
+AdamW \citep{kingma2015adam,loshchilov2019adamw} in every arm with the same
 constants: learning rate $10^{-4}$, $\beta = (0.9, 0.999)$,
 $\epsilon = 10^{-8}$, weight decay $0$, no schedule. Randomness comes from
-Philox 4x32-10 \citep{salmon2011parallel}, a counter-based generator: a
-perturbation is a pure function of (seed, step, weight index). The backward
-pass regenerates the exact $\varepsilon$ the forward pass used from the index
-alone, so no arm ever stores a perturbation buffer. Evaluation draws come
-from a seed disjoint from every training stream, so an evaluation sample is
-never a replay of some training step.
+Philox 4x32-10 \citep{salmon2011parallel}, so a perturbation is a pure function
+of (seed, step, weight index). The backward pass regenerates the forward pass's
+$\varepsilon$ from the index and no arm stores a perturbation buffer.
+Evaluation draws come from a seed disjoint from every training stream.
 
 \paragraph{Measuring cost.}
-Step time is wall time around the complete step --- host-to-device copy,
-buffer clears, weight sampling, forward, backward, parameter update --- taken
-with CUDA events on the device that ran it. For the ensemble a step is one
-member's step, so its training cost is $E$ times the figure. The VRAM number
-is the sum of the allocations an arm makes, computed from the buffer layout
-rather than read from a driver tool; it counts what the method requires and
-excludes allocator slack and context overhead.
-Section~\ref{sec:limitations} states what the step times are and are not.
+Step time is wall time around the complete step, taken with CUDA events on the
+device that ran it, and covers the host-to-device copy, buffer clears, weight
+sampling, forward, backward and parameter update. VRAM is the sum of an arm's
+allocations, computed from the buffer layout rather than read from a driver
+tool, and excludes allocator slack and context overhead.
 
 \paragraph{Measuring quality.}
-Evaluation loads a checkpoint and never trains. All four arms report through
-one code path: each supplies only a callback that returns draw $s$, and the
-shared harness does the rest, so no two arms can compute the same metric by
-different arithmetic. Per position, over $S$ draws with predictive
-distributions $p_s$ and mixture $\bar{p} = \frac{1}{S}\sum_s p_s$, it reports
-negative log predictive density of the mixture and of a single draw,
-expected calibration error over $15$ bins of next-token argmax confidence
-\citep{guo2017calibration}, and the decomposition
-\citep{kendall2017uncertainties}
+Evaluation loads a checkpoint and never trains. Each arm supplies only a
+callback returning draw $s$, and the shared harness does the rest. Per
+position, over $S$ draws with predictive distributions $p_s$ and mixture
+$\bar{p} = \frac{1}{S}\sum_s p_s$, it reports negative log predictive density
+of the mixture and of a single draw, expected calibration error over $15$ bins
+of next-token argmax confidence \citep{guo2017calibration}, and the
+decomposition \citep{kendall2017uncertainties}
 
 \begin{equation}
   \underbrace{H[\bar{p}]}_{\text{total}}
@@ -89,30 +76,19 @@ expected calibration error over $15$ bins of next-token argmax confidence
   \label{eq:decomp}
 \end{equation}
 
-in nats, accumulated in double precision. Samples are mixed as
-probabilities, never as logits: a logit average is a geometric mean and
-carries the wrong uncertainty.
+in nats, accumulated in double precision. Samples are mixed as probabilities,
+never as logits: a logit average is a geometric mean and carries the wrong
+uncertainty.
 
-Equation~\ref{eq:decomp} is an identity for any $S \geq 1$ and any way of
-drawing the samples, and both halves of the right-hand side are computed
-directly rather than one being derived from the other. Asserting it therefore
-tests the implementation and not the model: the algebra does not depend on the
-posterior, so a violation is an arithmetic error in the accumulation and can
-never mean the posterior is a poor fit. That is also its limit. The identity
-is normalisation-free --- it holds for any set of non-negative vectors,
-because $\bar{p}$ is the mean of the very vectors it is checked against --- so
-it will pass corrupted probabilities without complaint, and we verified that
-by injecting an unnormalised row and a stale sample buffer and watching it
-hold to $10^{-15}$ in both cases. It is a check on the decomposition, not on
-what was decomposed. The harness asserts it at $10^{-5}$ for every arm and
-exits nonzero.
+Equation~\ref{eq:decomp} is an identity for any $S \geq 1$ and any sampler, and
+both halves of the right-hand side are computed directly rather than one from
+the other, so asserting it tests the accumulation and not the posterior. It is
+also normalisation-free: an injected unnormalised row and an injected stale
+sample buffer both held it to $10^{-15}$. The harness asserts it at $10^{-5}$
+for every arm and exits nonzero.
 
-\paragraph{Samples, splits, and the off-distribution stream.}
-$S$ is a parameter for the Bayesian arms, where an extra draw costs one
-forward pass. It is not a parameter for the ensemble, whose $s$-th sample is
-its $s$-th trained member; that arm evaluates at $S = E$ and says so.
-Every reported number carries its split and its $S$; neither is ever
-inferred. The off-distribution stream is uniform-random token ids from a
-fixed seed, evaluated over the same number of positions as the
-in-distribution stream. It is a direction, not a second domain: epistemic
-uncertainty has to rise on it, and the harness warns when it does not.
+\paragraph{Splits and the off-distribution stream.}
+Every reported number carries its split and its $S$. The off-distribution
+stream is uniform-random token ids from a fixed seed, evaluated over the same
+number of positions as the in-distribution stream. Epistemic uncertainty has to
+rise on it, and the harness warns when it does not.

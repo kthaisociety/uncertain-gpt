@@ -1,86 +1,30 @@
 \section{Related work}
 \label{sec:related}
 
-% Four threads, and what this paper does that each does not.
+% One compact paragraph. State what each line of work did, in the fewest
+% words that keep the citation meaningful. No thread-by-thread structure, no
+% characterising a literature, and no restating what this paper does — that
+% belongs in the introduction, once.
 %
-% (1) Variational BNNs: \citet{hinton1993mdl}, \citet{graves2011practical},
-%     \citet{blundell2015weight}, reparameterisation \citep{kingma2014autoencoding},
-%     and the cost of drawing per-example perturbations \citep{wen2018flipout}.
-% (2) Natural-gradient / optimiser-shaped variational inference:
-%     \citet{khan2018vadam}, \citet{osawa2019practical}, \citet{shen2024ivon}.
-% (3) Post-hoc and covariance-structured posteriors — the closest existing
-%     work to the low-rank arm: \citet{ritter2018scalable},
-%     \citet{daxberger2021laplace}, \citet{maddox2019swag}.
-% (4) Non-Bayesian baselines that win on cost: deep ensembles
-%     \citep{lakshminarayanan2017simple}, MC dropout \citep{gal2016dropout}.
-%
-% Also place the evaluation vocabulary the paper adopts: calibration and
-% ECE \citep{guo2017calibration}, aleatoric/epistemic
-% \citep{kendall2017uncertainties}, distribution shift \citep{ovadia2019trust}.
+% \nocite{*} is gone: an entry cited nowhere disappears from the
+% bibliography. All 25 entries must stay cited somewhere in the body.
 
-\paragraph{Variational Bayesian neural networks.}
-\citet{hinton1993mdl} priced weight uncertainty as description length and
-gave the objective its first form. \citet{graves2011practical} made it run
-on real networks. \citet{blundell2015weight} put the reparameterisation of
-\citet{kingma2014autoencoding} inside it, which turned the variational
-parameters into ordinary backprop targets and produced Bayes-by-Backprop as
-it is used today. \citet{wen2018flipout} attacked the cost of drawing an
-independent perturbation per example, which a shared per-step draw does not
-pay but a large-batch implementation eventually must. The thread establishes
-the estimator; it does not price it against alternatives running on shared
-kernels. Our Bayes-by-Backprop arm is \citeauthor{blundell2015weight}'s
-method unchanged, and what this paper adds is that its buffer count and its
-step time sit beside three alternatives measured on the same device.
-
-\paragraph{Optimiser-shaped variational inference.}
-\citet{khan2018vadam} observed that Adam's second moment already estimates a
-curvature, so it can double as a posterior precision and the posterior costs
-almost nothing beyond the optimiser state. \citet{osawa2019practical} scaled
-natural-gradient variational inference to ImageNet, and \citet{shen2024ivon}
-carried the same idea to GPT-2-scale training. The thread's claim is that a
-posterior can be nearly free. We turn it into a measurement: the
-optimiser-shaped arm runs on the same kernels as an explicit-variance arm and
-an ensemble, so its step time and its VRAM are directly comparable to theirs.
-
-\paragraph{Post-hoc and covariance-structured posteriors.}
-This is the closest existing work to the low-rank arm. \citet{ritter2018scalable}
-fit a Kronecker-factored Laplace approximation to the curvature at a trained
-point, giving a structured covariance without changing the training run.
-\citet{daxberger2021laplace} turned that into a default recipe --- fit the
-Laplace approximation after the fact, often on the last layer only, and pay
-nothing during training. \citet{maddox2019swag} build exactly the covariance
-this paper's third arm uses, a low-rank factor plus a diagonal, but collect
-the factor from the SGD trajectory once training is over.
-
-All three are post-hoc by construction. The factor is read off a completed
-run, so the training loop is untouched and the cost lands at the end. Our
-low-rank arm inverts that: the rank-$r$ factor $A$ is a variational parameter
-updated every step by backprop through the sample, so the cost lands in the
-training loop, where it can be measured per step against mean-field and
-against an ensemble. The posterior is then fit by the same objective that
-fits the weights, rather than by a curvature estimate at a point, and the KL
-term has to be evaluated without ever forming the $P \times P$ covariance ---
-the identities in Section~\ref{sec:m:lowrank}. What we give up relative to
-the post-hoc line is
-its main selling point: those methods can be applied to a model somebody else
-trained, and this one cannot.
-
-\paragraph{Baselines that win on cost.}
-Deep ensembles \citep{lakshminarayanan2017simple} need no posterior machinery
-at all and match or beat variational methods on predictive uncertainty
-across the benchmarks of \citet{ovadia2019trust}, at $E$ times the parameters
-and $E$ times the training. That is
-why an ensemble is the control arm here and not a footnote: it is the thing
-the other three have to justify themselves against, and it is trained by the
-same code they are. MC dropout \citep{gal2016dropout} is the other cheap
-baseline. The network in this paper has no dropout layers, so it is out of
-scope rather than omitted for a reason.
-
-\paragraph{Evaluation vocabulary.}
-We report calibration as expected calibration error \citep{guo2017calibration}
-and split predictive uncertainty into aleatoric and epistemic parts in the
-sense of \citet{kendall2017uncertainties}. \citet{ovadia2019trust} is the
-reference for how such methods behave under dataset shift and is the standard
-this paper does not meet: our off-distribution stream is uniform-random
-tokens, which tests the direction of the epistemic term and nothing about
-shifted text (Section~\ref{sec:limitations}).
+Weight uncertainty was priced as description length by \citet{hinton1993mdl},
+made practical for real networks by \citet{graves2011practical}, and turned
+into Bayes-by-Backprop by \citet{blundell2015weight} through the
+reparameterisation of \citet{kingma2014autoencoding}; \citet{wen2018flipout}
+reduced the cost of drawing a perturbation per example.
+\citet{khan2018vadam} reuse Adam's second moment as a posterior precision,
+\citet{osawa2019practical} scale natural-gradient variational inference to
+ImageNet, and \citet{shen2024ivon} apply it at GPT-2 scale. Structured
+covariances fitted after training include a Kronecker-factored Laplace
+approximation at a trained point \citep{ritter2018scalable}, the same
+approximation as a recipe \citep{daxberger2021laplace}, and a
+low-rank-plus-diagonal factor collected from the SGD trajectory
+\citep{maddox2019swag}, which is the covariance the third arm here learns
+during training instead. Deep ensembles \citep{lakshminarayanan2017simple}
+match or beat variational methods on the benchmarks of \citet{ovadia2019trust}
+at $E$ times the training cost; MC dropout \citep{gal2016dropout} is the other
+cheap baseline, and the network here has no dropout layers. Metrics follow
+\citet{guo2017calibration} for calibration and \citet{kendall2017uncertainties}
+for the aleatoric and epistemic split.

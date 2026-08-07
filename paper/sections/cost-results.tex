@@ -6,48 +6,37 @@
 % contain has not been measured yet.
 
 The three posteriors price differently by an order of magnitude, and the
-ordering follows the buffer count rather than the arithmetic.
+ordering follows the buffer count rather than the arithmetic. Vadam's step
+lands within a millisecond of the ensemble member's: its posterior is optimiser
+state the run had already allocated, so it adds only the sampling kernel of
+Equation~\ref{eq:vadam-sigma}. Mean-field adds a second parameter-sized tensor,
+its AdamW moment pair, and a second update pass. The low-rank arm adds the
+factor $A$, which at $r = 8$ is eight tensors the size of the Bayesian
+parameter block, read, written and sampled from every step.
 
-Vadam is the cheapest posterior on both axes, and its step lands within a
-millisecond of the ensemble member's --- a deterministic step with a sampling
-kernel bolted on. Its posterior is the optimiser state the run had already
-allocated, so the only thing it adds is the sampling kernel of
-Equation~\ref{eq:vadam-sigma}. Mean-field costs what a second set of
-variational parameters costs: another parameter-sized tensor, its AdamW moment
-pair, and a second update pass. The low-rank arm is the outlier in every
-column, and the reason is the factor $A$ --- at $r = 8$ that is eight tensors
-the size of the Bayesian parameter block, read, written and sampled from every
-step. Buying correlation is a memory decision before it is a compute one.
+The ensemble's row is one member's, and its step is the deterministic step. Its
+bill is $E$ times that step and $E$ times the training run, so the cheapest arm
+per step is the most expensive arm to train, and the only one whose
+evaluation-time $S$ cannot be raised without paying again.
 
-The ensemble's row is one member's. Its step is the deterministic step,
-because that is exactly what it is, and its bill is $E$ times that step and
-$E$ times the training run. Read against the Bayesian arms it inverts the
-usual reading: the cheapest arm per step is the most expensive arm to train,
-and the only one whose evaluation-time $S$ cannot be raised without paying
-again.
+Vadam fails the one-batch overfit gate, which drives a single batch to
+near-zero loss. Its injected noise does not shrink as the mean fits, so its
+loss floors well above every other arm's while the run itself is healthy.
+Section~\ref{sec:quality} gives the reason.
 
-Vadam is also the arm that fails the one-batch overfit gate, and it fails it
-for a reason the cost table does not show and Section~\ref{sec:quality} does.
-The gate demands a single batch be driven to near-zero loss. Vadam's injected
-noise does not shrink as the mean fits, so the loss floors well above every
-other arm's while the run itself is healthy. It is a symptom of where its
-posterior sits, not of the optimiser.
-
-These are lower bounds. The card has a cooling fault, the runs span two
-sessions that did not throttle alike, and the low-rank arm's step time drifted
-within a single run (Section~\ref{sec:limitations}). The gaps between arms
-here are large enough to survive that; a difference of a few milliseconds
-between two rows is not a result.
+These are lower bounds, measured on a thermally limited card over two sessions
+(Section~\ref{sec:limitations}). A difference of a few milliseconds between two
+rows is not a result.
 
 \begin{table}[t]
   \centering
   \input{\generated/tab-cost}
   \caption{Cost per arm on one RTX 2060 Max-Q, from \texttt{runs/results.csv}.
-  \texttt{ms/step} is wall time around the complete step and VRAM is the sum
-  of the arm's allocations, both as defined in Section~\ref{sec:setup}. The
+  \texttt{ms/step} is wall time around the complete step and VRAM the sum of
+  the arm's allocations, both as defined in Section~\ref{sec:setup}. The
   ensemble's row is \emph{one member}; multiply by $E = 5$ for the training
-  bill. \texttt{overfit} is the one-batch memorisation gate, \texttt{train}
-  the $100{,}000$-step run. Step times are lower bounds, not controlled
-  measurements (Section~\ref{sec:limitations}).}
+  bill. \texttt{overfit} is the one-batch memorisation gate, \texttt{train} the
+  $100{,}000$-step run. Step times are lower bounds
+  (Section~\ref{sec:limitations}).}
   \label{tab:cost}
 \end{table}

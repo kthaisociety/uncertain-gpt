@@ -4,47 +4,22 @@
 % What this paper measures: the GPU cost of a posterior on a transformer,
 % and what quality that cost buys. State the controlled-comparison design
 % here — one network, one dataset, one forward/backward pass, only the
-% posterior varies — and the contributions. No results in this section.
+% posterior varies. No results in this section. No claims about the field:
+% this paper may state what it measured and what a cited work says.
 
 A posterior over the weights of a transformer is paid for in GPU memory and
-GPU time. The published record rarely prices it. Variational methods are
-reported against ensembles trained by other groups, on other cards, through
-other kernels, and the cost column is missing or is quoted from a framework
-whose overheads nobody controlled.
+GPU time. This paper prices four of them against each other on one network,
+one corpus and one card.
 
-We put four uncertainty methods on one network and priced them against each
-other. Bayes-by-Backprop \citep{blundell2015weight}, Vadam
-\citep{khan2018vadam}, a learned low-rank-plus-diagonal Gaussian posterior,
-and a deep ensemble \citep{lakshminarayanan2017simple} share a single CUDA
-implementation of GPT-2 \citep{radford2019language}: the same kernels, the
-same forward and backward pass, the same dataloader handing out the same
-batches in the same order, the same AdamW hyperparameters, the same
-precision. Each method's source file contains only how it draws a weight
-vector and how it updates the parameters behind that draw. Everything else
-lives in one shared header, so a change to the network reaches all four arms
-at once and two arms cannot drift apart.
+Bayes-by-Backprop \citep{blundell2015weight}, Vadam \citep{khan2018vadam}, a
+learned low-rank-plus-diagonal Gaussian posterior, and a deep ensemble
+\citep{lakshminarayanan2017simple} share a single CUDA implementation of GPT-2
+\citep{radford2019language}: the same kernels, the same forward and backward
+pass, the same batches in the same order, the same AdamW hyperparameters, the
+same precision. Each method's source file contains only how it draws a weight
+vector and how it updates the parameters behind that draw, and everything else
+lives in one shared header. Any difference between two arms is the posterior.
 
-That is the whole design. Any difference between two arms is the posterior,
-because nothing else is permitted to differ.
-
-Writing the network in CUDA rather than on top of a framework is what makes
-the cost side legible. A posterior is not an abstraction here; it is a
-count of parameter-sized buffers and a count of kernel passes over them, and
-both are visible in the source.
-
-Contributions:
-
-\begin{itemize}
-  \item A controlled comparison of three Bayesian posteriors and a deep
-        ensemble on one network, one corpus, and one card, sharing a single
-        implementation of the network rather than one per arm.
-  \item Cost reported in the units it is paid in: parameter-sized buffers
-        and VRAM, and milliseconds per training step on the same device.
-  \item One shared uncertainty harness. All four arms produce NLPD, ECE, and
-        the aleatoric/epistemic decomposition through the same arithmetic,
-        gated by an exact algebraic identity that fails loudly when the
-        probabilities are wrong.
-  \item An account of the optimisation work each posterior demanded --- what
-        had to be derived rather than tuned, what had to be regenerated
-        rather than stored, and which constants are load-bearing.
-\end{itemize}
+In CUDA a posterior is a count of parameter-sized buffers and a count of kernel
+passes over them, and cost is reported in those units and in milliseconds per
+step. Quality comes from one harness shared by all four arms.

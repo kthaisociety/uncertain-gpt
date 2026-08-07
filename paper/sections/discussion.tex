@@ -1,64 +1,45 @@
 \section{Discussion}
 \label{sec:discussion}
 
-% Put cost and quality together: what the cost-per-unit-of-quality picture
-% looks like once both tables are filled, which bottleneck each arm is
-% actually paying, and what a practitioner should take away.
+% Report. Do not stage the argument, rank the paper's own findings, address
+% the reader, or comment on the paper's reasoning. State only what was
+% measured here and what a cited work claims.
 
-Put the two tables side by side and the ensemble is not a cheap baseline the
-Bayesian arms have to beat. It is the expensive arm --- $E$ training runs ---
-that beats them anyway, on predictive quality and on the one thing an
-uncertainty estimate is supposed to do, which is change when the input does.
-The variational arms buy their posterior inside a single training run, which
-is the whole point of the literature they come from, and at this scale what
-they get for it is a well-calibrated model whose epistemic term barely reacts
-to uniform noise.
+The ensemble costs $E$ training runs and returns the best predictive quality
+and the widest separation between in- and off-distribution input. The
+variational arms buy their posterior inside one training run and return a
+better-calibrated model whose epistemic term barely reacts to uniform noise.
+Calibration and separation measure different failures.
 
-That is a real trade rather than a verdict. Calibration and separation are
-different failures. A model that has to know when it is guessing on data it
-was trained for wants the variational arms, which are honest about confidence
-at a fraction of the ensemble's training bill. A model that has to notice
-input it has never seen wants the ensemble, and at this scale nothing here
-suggests a cheaper way to get that behaviour.
+The low-rank arm pays memory: rank $8$ costs eight covariance tensors over the
+Bayesian parameter block, and buys correlation within a weight matrix and none
+across matrices. Mean-field pays a second variational tensor and a second
+optimiser pass. Vadam pays almost nothing and gets almost nothing, which
+Section~\ref{sec:quality} traces to $N s$ against $\lambda$. The claim that a
+posterior can be nearly free
+\citep{khan2018vadam,osawa2019practical,shen2024ivon} is not contradicted by
+that. The posterior was nearly free. It was also nearly the prior. Whether the
+two can be separated at this gradient scale is open. The knob is $\lambda$,
+which stayed at the initialisation value, because choosing it by anything else
+is a modelling decision and not a measurement.
 
-Each arm pays a different bottleneck, and the source makes it legible. The
-low-rank arm pays memory: rank $8$ costs eight covariance tensors over the
-Bayesian parameter block, and it buys correlation within a weight matrix and
-nothing across matrices. Mean-field pays a second variational tensor and a
-second optimiser pass. Vadam pays almost nothing, and at this scale gets
-almost nothing --- Section~\ref{sec:quality} traces that to $N s$ against
-$\lambda$ rather than to any implementation of it. The claim that a posterior
-can be nearly free \citep{khan2018vadam,osawa2019practical,shen2024ivon} is
-not contradicted by that: the posterior \emph{was} nearly free. It was also
-nearly the prior. Whether the two can be separated at this gradient scale is
-open, and the knob is $\lambda$, which we did not turn because choosing it by
-anything but the initialisation is a modelling decision and not a measurement.
-
-The most useful negative result here is about $S$. The estimator that reports
-epistemic uncertainty is itself Monte Carlo, and under-sampling it does not
-add noise symmetrically --- it suppresses the in-distribution term more than
-the off-distribution one, so a small $S$ makes a variational posterior look
-better at separation than it is. Any published ratio of this kind that does
-not state its $S$ cannot be read.
+The estimator that reports epistemic uncertainty is itself Monte Carlo, and
+under-sampling suppresses the in-distribution term more than the
+off-distribution one, so a small $S$ makes a variational posterior look better
+at separation than it is.
 
 \paragraph{Reproducibility.}
-Everything in this paper runs from the checkpoints in the repository; no
-number required a retraining run, and evaluation is deterministic and
-reproduces bit for bit. The same code is packaged as a PyTorch extension: it
-compiles the four arms into one translation unit, implements no kernel,
-optimiser or metric of its own, and reproduces the binaries' output exactly.
-Its per-step overhead measured between $-0.45\%$ and $+0.80\%$, which is
-inside run-to-run spread --- the wrapper is a call path, not a second
-implementation. Training is the part that does not reproduce: three backward
-kernels accumulate with \texttt{atomicAdd}, so two identical runs diverge in
-the last bits and then amplify (Section~\ref{sec:limitations}).
+Everything here runs from the checkpoints in the repository. No number required
+a retraining run, and evaluation reproduces bit for bit. The same code is
+packaged as a PyTorch extension that compiles the four arms into one
+translation unit, implements no kernel, optimiser or metric of its own, and
+reproduces the binaries' output exactly at a per-step overhead between
+$-0.45\%$ and $+0.80\%$, inside run-to-run spread. Training does not reproduce
+(Section~\ref{sec:limitations}).
 
 \paragraph{What would change the picture.}
-Three things, in the order they would be worth doing. A sweep over each arm's
-injected noise scale, which runs against saved checkpoints and would separate
-posterior quality from the amount of noise an arm happens to inject --- as
-reported, those are confounded. A second text domain in place of the synthetic
-off-distribution stream, which is the minimum for any claim that touches the
-distribution-shift literature \citep{ovadia2019trust}. And more than one seed
-per arm, which is what would turn the small gaps in these tables into
-resolvable ones.
+A sweep over each arm's injected noise scale, which runs against saved
+checkpoints and would separate posterior quality from the amount of noise an
+arm injects. A second text domain in place of the synthetic off-distribution
+stream \citep{ovadia2019trust}. More than one seed per arm, which would turn
+the small gaps in these tables into resolvable ones.
