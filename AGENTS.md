@@ -66,6 +66,32 @@ built against (`torch.version.cuda`) — torch refuses the build otherwise, and 
 is right to. The system `nvcc` is not necessarily that one. `make NVCC=<path>`
 builds the binaries with the same toolchain, which is what a timing comparison
 against the wrapper requires.
+## Kernel correctness
+
+`dev/` holds one file per kernel, each checked against a CPU reference; see
+`dev/Makefile`. Three of them do not follow the `train_bnn.c` pattern because
+what they test is not in `train_bnn.c`:
+
+    make -C dev vadam block_loop     # then ./dev/{vadam_update,vadam_sample,block_loop}
+
+`vadam_update` / `vadam_sample` include `../train_bnn_vadam.cu` and define
+`UNCERTAIN_AS_LIBRARY` — the same guard the Python extension uses to compile out
+an arm's `main()` — so they test the REAL kernels, not a copy that can drift.
+`block_loop` gradient-checks the `L>1` block loop, which `train_bnn.c` cannot
+cover at all (it is single-block).
+
+**Two traps these hit, which any new numerical check here will hit too:**
+
+- **Never normalize an error by `|want|`.** Vadam's line 5 and a random
+  directional derivative both cancel to near zero for some inputs, where the
+  relative error against `|want|` is 100% on correct arithmetic. Normalize by
+  the scale of the computation (sum of the input terms, or `||g||`), the way
+  `train_bnn_lowrank.cu`'s check 3 already does for its off-diagonals.
+- **A float32 forward cannot resolve a single-parameter finite difference**
+  at this size: the signal `2*h*g_i` is the size of the loss's own noise.
+  Perturb a whole tensor along a Rademacher direction instead, with `h`
+  relative to that tensor's RMS — LayerNorm gains sit at 1.0 and weights at
+  0.02, so one absolute `h` leaves the gains uncertified.
 
 ## Sharp edges
 
@@ -91,6 +117,11 @@ against the wrapper requires.
   "340 MB/buffer". At the current `Config` (C=384, L=6) it is 10,616,832 of
   11,061,531 (96%) and 44 MB/buffer. Recompute from the `Config` literal and
   `param_offsets` — never copy a count out of a header comment.
+- **Head size must be exactly `HS` = 64.** `HS` is a compile-time define and the
+  FlashAttention kernels index q/k/v with it, so any config where `C/NH != 64`
+  read past every head. `gpt2_forward` now `UNCERTAIN_ABORT`s with a message;
+  before that it returned confident garbage. Small test configs must respect it — that
+  is why `dev/block_loop.cu` is `C=64 NH=1`, not the `C=8` it was specified at.
 - `scorecard.c` parses stdout by format string (`step %d | nll %f | ...` and
   `summary:` lines, first 3 only). Changing those formats breaks the scorecard.
 - `paper/tables/make_tables.py` parses the SAME two formats plus the `eval:`

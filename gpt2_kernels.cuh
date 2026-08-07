@@ -762,6 +762,16 @@ static float gpt2_forward(float *acts, const float *params, const int *inputs,
     size_t NBTC = (size_t)B * T * C;
     int Tr = (T + BR - 1) / BR;
 
+    // HS is compile-time in the FlashAttention kernels and they index q/k/v
+    // with it, so a config whose head size is not HS reads past every head and
+    // returns confident garbage with no error. Caught here rather than in the
+    // numbers: dev/block_loop.cu walked into it at C=8, NH=2.
+    if (C / NH != HS || C % NH != 0) {
+        printf("config error: head size C/NH = %d, but the attention kernels are "
+               "compiled for HS = %d\n", C / NH, HS);
+        UNCERTAIN_ABORT("gpt2_forward: head size must equal HS");
+    }
+
     k_encoder_forward<<<ceil_div((int)NBTC, BS), BS>>>(
         acts + a.enc, inputs, params + p.wte, params + p.wpe, T, C, NBTC);
 

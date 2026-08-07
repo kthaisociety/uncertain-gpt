@@ -21,6 +21,25 @@ train_bnn_cpu.o: ../train_bnn.c
 %: %.cu common.h train_bnn_cpu.o
 	$(NVCC) $(NVCC_FLAGS) $< train_bnn_cpu.o -lm -lcublas -o $@
 
+# The two Vadam kernels are the exception to the rule above: they live in
+# ../train_bnn_vadam.cu, not in train_bnn.c, so these files include it and
+# define UNCERTAIN_AS_LIBRARY — the guard the Python extension already uses to
+# compile out an arm's main() — to test the REAL kernels, not a copy. (The
+# -DSKIP_MAIN above is train_bnn.c's own, separate guard.) That pulls in
+# gpt2_kernels.cuh, whose cuda_check_/ceil_div collide with common.h's, so
+# common.h is deliberately not used and train_bnn_cpu.o is not linked.
+#   make vadam && ./vadam_update && ./vadam_sample
+VADAM = vadam_update vadam_sample
+vadam: $(VADAM)
+$(VADAM): %: %.cu ../train_bnn_vadam.cu ../gpt2_kernels.cuh
+	$(NVCC) $(NVCC_FLAGS) -DNBLOCKS=6 $< -lcublas -o $@
+
+# Finite-difference check on the L>1 block loop. Uses gpt2_kernels.cuh's
+# forward/backward directly — no optimizer, no train_bnn.c — for the same
+# common.h reason as the two files above.
+block_loop: block_loop.cu ../gpt2_kernels.cuh
+	$(NVCC) $(NVCC_FLAGS) $< -lcublas -o $@
+
 clean:
-	rm -f $(KERNELS) train_bnn_cpu.o
-.PHONY: all clean
+	rm -f $(KERNELS) $(VADAM) block_loop train_bnn_cpu.o
+.PHONY: all clean vadam

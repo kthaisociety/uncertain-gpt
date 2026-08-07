@@ -219,10 +219,10 @@ static int vadam_eval(int argc, char **argv) {
  *
  * Compiled out when this file is INCLUDED by the Python extension
  * (see the note over train_bnn_gpu.cu's main). vadam_draw above is shared
- * with uncertain::VadamTrainer unchanged.
+ * with uncertain::VadamTrainer unchanged. dev/vadam_{update,sample}.cu
+ * include it the same way, so they test THESE kernels rather than a copy.
  * ===================================================================== */
 #ifndef UNCERTAIN_AS_LIBRARY
-
 int main(int argc, char **argv) {
     if (argc > 1 && argv[1][0] == 'e') return vadam_eval(argc, argv);
     bool overfit = (argc > 1 && argv[1][0] == 'o');
