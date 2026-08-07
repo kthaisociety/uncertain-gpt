@@ -37,9 +37,19 @@ python3 paper/tables/make_tables.py --selftest   # parser self-check
   two `summary:` lines `uq_report()` prints in `gpt2_kernels.cuh`, and the
   `eval:` line above them supplies the split and *S*.
 
-and writes `tables/generated/tab-{cost,quality,uncertainty}.tex`, which the
-results sections `\input`. Those files are **gitignored on purpose**: a
+and writes `tables/generated/tab-{cost,quality,uncertainty,ood}.tex`, which
+the results sections `\input`. Those files are **gitignored on purpose**: a
 committed table could outlive the measurement it came from.
+
+The quality and uncertainty tables carry **one row per (arm, split)** and
+prefer neither split — which split the paper standardises on is still open,
+and a table that silently picked would settle it by accident.
+`tab-ood.tex` exists because the off-distribution epistemic term is **not**
+a per-split measurement: the OOD stream is a fixed synthetic token sequence
+(a seed, not a split), so it is stated once per arm, with the OOD/ID ratio
+given per split because only the denominator moves. If the two splits ever
+report *different* OOD values that cell goes unmeasured and the generator
+says so on stderr — the premise of stating it once would have broken.
 
 The one rule the generator enforces: a cell is either a number that was
 measured or the macro `\NA`, which `preamble.tex` renders as a loud red

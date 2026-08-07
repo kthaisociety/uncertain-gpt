@@ -13,18 +13,42 @@
 
 \input{preamble}
 
-\title{\todo{title}}
+\title{What a posterior over a transformer costs, and what it buys}
 \author{\todo{authors}}
-\date{\todo{date}}
+\date{\today}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
 % What the paper measures and on what. One controlled comparison: four
-% posterior approximations, one shared network, one card. State the
-% question, not an answer — the numbers are not in yet.
-\todo{abstract}
+% posterior approximations, one shared network, one card. Every claim here
+% has to be a cell in a generated table or a constant from the source.
+Four uncertainty methods, one CUDA implementation of a GPT-2, one card.
+Bayes-by-Backprop, Vadam, a learned low-rank-plus-diagonal Gaussian
+posterior and a five-member deep ensemble share the same kernels, the same
+forward and backward pass, the same batches in the same order, and the same
+optimiser constants; each method's source file holds only how it draws a
+weight vector and how it updates the parameters behind that draw. We price
+each posterior in parameter-sized buffers, VRAM and milliseconds per
+training step, and evaluate all four through one harness --- NLPD, expected
+calibration error, and an aleatoric/epistemic decomposition gated by an
+exact algebraic identity --- on $11$M parameters trained for $100{,}000$
+steps of character-level text8.
+
+The ensemble has the best predictive quality and separates in-distribution
+from off-distribution input by more than twice the margin of any variational
+arm, and it is the worst calibrated of the four. Vadam holds the opposite
+corner: the cheapest posterior, the best calibration, the worst predictive
+quality. Its posterior scale stays at the prior, which we trace to the
+dataset size entering the precision as $N s$ against $\lambda$ rather than to
+its implementation. Converging the sample count $S$ \emph{widens} the
+ensemble's separation advantage instead of narrowing it, because
+under-sampling suppresses in-distribution epistemic uncertainty more than
+off-distribution --- a separation ratio quoted without its $S$ cannot be
+read. Step times are lower bounds on one thermally limited card and the
+off-distribution stream is synthetic, so what is measured is the ratio
+between arms on one implementation, not a claim about scale.
 \end{abstract}
 
 \input{sections/introduction}
@@ -36,11 +60,10 @@
 \input{sections/discussion}
 \input{sections/limitations}
 
-% The skeleton has no prose, so it has no \cite commands and the
-% bibliography would render empty. \nocite{*} pulls every verified entry
-% in, which is also how you check that references.bib still compiles.
-% DELETE this line once the prose cites for real.
-\nocite{*}
+% The prose now cites for real, so \nocite{*} is gone. Every entry in
+% references.bib is cited from the body; `make -C paper` is clean of
+% undefined-citation warnings, and an uncited entry silently disappearing
+% from the bibliography is the thing to watch for when editing.
 \bibliographystyle{plainnat}
 \bibliography{references}
 

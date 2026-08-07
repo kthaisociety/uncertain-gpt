@@ -14,8 +14,13 @@ Inputs (both optional; whatever is missing becomes a placeholder):
                      gpt2_kernels.cuh, optionally preceded by the "eval:"
                      line uq_evaluate() prints.
 
-Outputs: paper/tables/generated/tab-{cost,quality,uncertainty}.tex, each a
-bare `tabular` the document wraps in a float.
+Outputs: paper/tables/generated/tab-{cost,quality,uncertainty,ood}.tex, each
+a bare `tabular` the document wraps in a float.
+
+Splits: the quality and uncertainty tables carry one row per (arm, split),
+never a preferred one. The off-distribution epistemic is NOT one of those
+columns -- the OOD stream is a fixed synthetic sequence with no split
+dependence, so it gets its own table and is stated once per arm.
 
 THE ONE RULE: a cell is either a number that was measured or the macro
 \\NA, which the preamble renders as a loud TODO. There is no third case,
@@ -37,6 +42,11 @@ NA = r"\NA"
 # prose is where they get their full names.
 ARMS = ["BBB", "Vadam", "LowR", "Ens"]
 ARM_ORDER = {k: i for i, k in enumerate(ARMS)}
+
+# Both splits, always, in this order. Nothing here prefers one: which split
+# the paper standardises on is an open decision, and a table that silently
+# picked would resolve it by accident.
+SPLITS = ["val", "test"]
 
 # What the arms call themselves in eval output vs in the scorecard CSV.
 EVAL_ALIAS = {"bbb": "BBB", "vadam": "Vadam", "lowr": "LowR", "ens": "Ens"}
@@ -167,6 +177,19 @@ def pick(records, key, split):
     return max(same or cands, key=lambda r: r["mtime"])
 
 
+def pick_split(records, key, split):
+    """Most recent record for exactly this arm and this split, or None.
+    Unlike pick() it never falls back: a val number must not be able to
+    appear under a test label."""
+    cands = [r for r in records
+             if canon(r["arm"])[0] == key and r.get("split") == split]
+    return max(cands, key=lambda r: r["mtime"]) if cands else None
+
+
+def ratio(a, b):
+    return None if not a or not b else a / b
+
+
 # --------------------------------------------------------------------------
 # emit
 # --------------------------------------------------------------------------
@@ -215,36 +238,63 @@ def cost_table(csv_rows, csv_path):
 def quality_table(records, srcs):
     body = []
     for key in ARMS:
-        r = pick(records, key, "val") or {}
-        body.append([
-            tex_escape(canon(r["arm"])[1] if r.get("arm") else key),
-            tex_escape(r.get("split") or "") or NA,
-            str(r["S"]) if r.get("S") else NA,
-            fmt(r.get("nlpd_single"), 4),
-            fmt(r.get("nlpd_mix"), 4),
-            fmt(r.get("ece"), 4),
-        ])
+        for split in SPLITS:
+            r = pick_split(records, key, split) or {}
+            body.append([
+                tex_escape(canon(r["arm"])[1] if r.get("arm") else key),
+                split,
+                str(r["S"]) if r.get("S") else NA,
+                fmt(r.get("nlpd_single"), 4),
+                fmt(r.get("nlpd_mix"), 4),
+                fmt(r.get("ece"), 4),
+            ])
     return table(["Arm", "Split", "$S$", "NLPD (single draw)",
                   "NLPD (mixture)", "ECE"],
                  "llrrrr", body, "source: %s" % srcs)
 
 
 def uncertainty_table(records, srcs):
+    """In-distribution decomposition only. The off-distribution term is
+    split-independent by construction and lives in ood_table()."""
     body = []
     for key in ARMS:
-        r = pick(records, key, "val") or {}
-        body.append([
-            tex_escape(canon(r["arm"])[1] if r.get("arm") else key),
-            tex_escape(r.get("split") or "") or NA,
-            str(r["S"]) if r.get("S") else NA,
-            fmt(r.get("total"), 3),
-            fmt(r.get("alea"), 3),
-            fmt(r.get("epi"), 4),
-            fmt(r.get("epi_ood"), 4),
-        ])
+        for split in SPLITS:
+            r = pick_split(records, key, split) or {}
+            body.append([
+                tex_escape(canon(r["arm"])[1] if r.get("arm") else key),
+                split,
+                str(r["S"]) if r.get("S") else NA,
+                fmt(r.get("total"), 3),
+                fmt(r.get("alea"), 3),
+                fmt(r.get("epi"), 4),
+            ])
     return table(["Arm", "Split", "$S$", "Total", "Aleatoric",
-                  "Epistemic (ID)", "Epistemic (OOD)"],
-                 "llrrrrr", body, "source: %s" % srcs)
+                  "Epistemic (ID)"],
+                 "llrrrr", body, "source: %s" % srcs)
+
+
+def ood_table(records, srcs):
+    """One row per arm. The OOD stream is a fixed synthetic token sequence
+    (a seed, not a split), so its epistemic term is one measurement, not one
+    per split -- and the guard below refuses to state it once if the two
+    splits ever stop agreeing."""
+    body, disagreed = [], []
+    for key in ARMS:
+        rs = {s: pick_split(records, key, s) or {} for s in SPLITS}
+        vals = {r["epi_ood"] for r in rs.values() if r.get("epi_ood") is not None}
+        if len(vals) > 1:
+            disagreed.append(key)
+        epi_ood = vals.pop() if len(vals) == 1 else None
+        Ss = {r["S"] for r in rs.values() if r.get("S")}
+        label = next((canon(r["arm"])[1] for r in rs.values() if r.get("arm")), key)
+        body.append(
+            [tex_escape(label),
+             str(Ss.pop()) if len(Ss) == 1 else NA,
+             fmt(epi_ood, 4)]
+            + [fmt(ratio(epi_ood, rs[s].get("epi")), 3) for s in SPLITS])
+    return (table(["Arm", "$S$", "Epistemic (OOD)"]
+                  + ["OOD/ID (%s)" % s for s in SPLITS],
+                  "lrrrr", body, "source: %s" % srcs), disagreed)
 
 
 def main():
@@ -266,10 +316,12 @@ def main():
             if log_paths else "(no logs found)")
 
     os.makedirs(args.out, exist_ok=True)
+    ood, disagreed = ood_table(records, srcs)
     written = {
         "tab-cost.tex": cost_table(csv_rows, csv_path),
         "tab-quality.tex": quality_table(records, srcs),
         "tab-uncertainty.tex": uncertainty_table(records, srcs),
+        "tab-ood.tex": ood,
     }
     for name, text in written.items():
         with open(os.path.join(args.out, name), "w") as fh:
@@ -279,6 +331,10 @@ def main():
     print("make_tables: %d csv row(s), %d eval record(s) -> %s"
           % (len(csv_rows), len(records), args.out))
     print("make_tables: %d placeholder cell(s) still unmeasured" % missing)
+    for key in disagreed:
+        print("make_tables: %s reports different OOD epistemic per split -- "
+              "the stream is supposed to be split-independent; cell left "
+              "unmeasured" % key, file=sys.stderr)
     return 0
 
 
@@ -314,9 +370,31 @@ def selftest():
     # missing data must produce the macro, never a number
     assert fmt(None, 3) == NA and num("nope") is None
     t = quality_table([], "none")
-    assert t.count(NA) == len(ARMS) * 5, t
+    assert t.count(NA) == len(ARMS) * len(SPLITS) * 4, t
     assert "0.0" not in t, t
     assert canon("LowR8") == ("LowR", "LowR8") and canon("vadam")[1] == "Vadam"
+
+    # both splits, and no fallback between them: an arm measured only on val
+    # must leave its test row unmeasured rather than repeat the val number.
+    def rec(arm, split, **kw):
+        d = {"arm": arm, "split": split, "S": 32, "mtime": 0.0, "src": "t"}
+        d.update(kw)
+        return d
+    only_val = [rec("bbb", "val", nlpd_mix=1.5582, ece=0.0240, epi=0.0107,
+                    epi_ood=0.0119, total=1.602, alea=1.591)]
+    q = quality_table(only_val, "none")
+    assert "1.5582" in q and q.count("1.5582") == 1, q
+    assert pick_split(only_val, "BBB", "test") is None
+    # ...and the OOD term is stated ONCE per arm, with the ratio per split
+    ood, bad = ood_table(only_val, "none")
+    assert not bad and ood.count("0.0119") == 1, ood
+    assert "1.112" in ood, ood                      # 0.0119 / 0.0107
+    assert ood.count(NA) == len(ARMS) * 4 - 3, ood  # BBB has all but test ratio
+    # a split-dependent OOD term breaks the premise of stating it once, so
+    # the cell must go unmeasured and say so, not average or pick one
+    split_dep = only_val + [rec("bbb", "test", epi=0.0103, epi_ood=0.0130)]
+    ood2, bad2 = ood_table(split_dep, "none")
+    assert bad2 == ["BBB"] and "0.0119" not in ood2 and "0.0130" not in ood2, ood2
     print("selftest: ok")
     return 0
 

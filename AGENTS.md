@@ -28,9 +28,13 @@ Two invariants worth knowing before touching it:
 
 - **`total == aleatoric + epistemic` is exact algebra, not an approximation.**
   It is asserted at 1e-5 in double precision and the process exits nonzero.
-  Because the identity is independent of the posterior, a violation means the
-  *probabilities* are wrong (unnormalized row, stale buffer, a sample callback
-  that never wrote), never a modelling problem. Keep the assertion.
+  A violation is an arithmetic error in `uq_fold_batch`, never a modelling
+  problem. Keep the assertion — but **do not trust it further than that.** The
+  identity is normalization-free (`p_bar` is the mean of the very vectors it is
+  checked against), so it holds for ANY non-negative vectors: an unnormalized
+  row and a stale sample buffer were both injected and both passed at 1e-15
+  while the printed metrics were badly wrong. `uq_selftest` catches fold
+  arithmetic first, more cheaply, at 1e-12 — but only at `V=2, S<=2`.
 - **Eval loads checkpoints; it never trains.** Every new metric must be
   obtainable from `runs/*.bin` or it costs another multi-hour training run.
 
@@ -138,6 +142,18 @@ behind it renders as a loud red `TODO`, never as a plausible value.
 `paper/main.pdf` is tracked and rebuilt by `.github/workflows/paper.yml` so
 GitHub can render it; CI has no `runs/`, so **the committed PDF's tables are
 all `TODO` by design** — trust a local build for numbers.
+
+Two presentation choices there are load-bearing, not cosmetic; `paper/README.md`
+says why. The quality and uncertainty tables carry **one row per (arm, split)
+and prefer neither** — which split the paper standardises on is an open
+decision, and a table that picks would settle it silently. And `tab-ood.tex`
+is a separate table because the OOD stream is a fixed synthetic sequence with
+**no split dependence**; stating it per split implies one. The generator
+refuses to state it once if the two splits ever disagree.
+
+The prose cites for real and `\nocite{*}` is gone, so an entry in
+`references.bib` that loses its last citation silently vanishes from the
+bibliography. `make -C paper` must stay clean of undefined-citation warnings.
 
 ## Maintaining this file
 

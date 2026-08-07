@@ -67,12 +67,50 @@ overfit test reaches the same loss either way.
 % Variational online Newton read as a perturbation of Adam: the second
 % moment doubles as the posterior precision, so the posterior is (almost)
 % free. Note where N enters the scale.
-%
-% DELIBERATELY LEFT PENDING. This arm's trained checkpoint is under
-% investigation; describing the implementation before that verdict risks
-% documenting behaviour that is about to change. Write this subsection once
-% the investigation closes.
-\todo{Vadam}
+
+Adam's second moment already estimates a curvature, so \citet{khan2018vadam}
+reuse it as the posterior precision instead of learning a second set of
+variance parameters. The posterior is again a diagonal Gaussian, but only its
+mean is a free parameter: the scale is read off the optimiser,
+\begin{equation}
+  \sigma_i = \frac{1}{\sqrt{N s_i + \lambda}} ,
+  \qquad
+  w_i = \mu_i + \sigma_i \varepsilon_i ,
+  \label{eq:vadam-sigma}
+\end{equation}
+with $s$ the second moment, $N$ the training token count and $\lambda$ the
+prior precision. We transcribe Figure~1 of \citet{khan2018vadam} unchanged:
+\begin{align}
+  m &\leftarrow \gamma_1 m + (1 - \gamma_1)\left(g + \tfrac{\lambda}{N}\mu\right) , \\
+  s &\leftarrow \gamma_2 s + (1 - \gamma_2)\, g \circ g , \\
+  \mu &\leftarrow \mu - \alpha\, \hat{m} \big/ \left(\sqrt{\hat{s}} + \tfrac{\lambda}{N}\right) ,
+\end{align}
+with $\hat{m}, \hat{s}$ the bias-corrected moments and $g$ the gradient at the
+sampled weights. That is one Adam step with the prior folded into the gradient
+and $\lambda/N$ in place of Adam's $\epsilon$. Nothing beyond Adam's own
+$(m, s)$ is allocated, which is the arm's entire claim on cost.
+
+Two details are load-bearing and neither is a free choice.
+
+The square root appears in the $\mu$ denominator and not in
+Equation~\ref{eq:vadam-sigma}, where $\sigma$ takes $s$ raw. It reads like a
+transcription error and is not: footnote~2 of \citet{khan2018vadam} states
+that the square root ``does not affect a fixed point but might still affect
+the steps taken''. The asymmetry is the paper's, and we kept it, because
+matching a published method matters more here than making it internally
+tidy.
+
+$\lambda$ is derived, not tuned. Matching the initialisation to the prior it
+is drawn from gives $\lambda = 1/\sigma_{\text{init}}^{2} = 2500$, which also
+fixes the prior standard deviation at $0.02$. And $N$ sits inside the
+posterior rather than beside it: what the data contributes to the precision
+in Equation~\ref{eq:vadam-sigma} is $N s$, measured against $\lambda$. Two
+consequences follow. Small gradients do not merely shrink the posterior's
+movement, they leave it at the prior --- Section~\ref{sec:quality} reports
+where this arm landed. And $N$ is a property of the training run, not of the
+data in front of the model, so evaluating on validation or test still reads
+$N$ from the training split; taking it from the split being evaluated would
+silently rescale every posterior sample.
 
 \subsection{Low-rank plus diagonal covariance}
 \label{sec:m:lowrank}

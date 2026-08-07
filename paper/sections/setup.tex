@@ -95,12 +95,17 @@ carries the wrong uncertainty.
 
 Equation~\ref{eq:decomp} is an identity for any $S \geq 1$ and any way of
 drawing the samples, and both halves of the right-hand side are computed
-directly rather than one being derived from the other. Asserting it
-therefore tests the implementation and not the model: because the algebra
-does not depend on the posterior, a violation means the probabilities are
-wrong --- an unnormalised softmax row, a stale buffer, a sample callback that
-never wrote --- and can never mean the posterior is a poor fit. The harness
-asserts it at $10^{-5}$ for every arm and exits nonzero.
+directly rather than one being derived from the other. Asserting it therefore
+tests the implementation and not the model: the algebra does not depend on the
+posterior, so a violation is an arithmetic error in the accumulation and can
+never mean the posterior is a poor fit. That is also its limit. The identity
+is normalisation-free --- it holds for any set of non-negative vectors,
+because $\bar{p}$ is the mean of the very vectors it is checked against --- so
+it will pass corrupted probabilities without complaint, and we verified that
+by injecting an unnormalised row and a stale sample buffer and watching it
+hold to $10^{-15}$ in both cases. It is a check on the decomposition, not on
+what was decomposed. The harness asserts it at $10^{-5}$ for every arm and
+exits nonzero.
 
 \paragraph{Samples, splits, and the off-distribution stream.}
 $S$ is a parameter for the Bayesian arms, where an extra draw costs one

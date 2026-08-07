@@ -66,16 +66,20 @@ sweep over the noise scale within each arm and a comparison of curves rather
 than of single points; that runs against saved checkpoints and needs no
 retraining.
 
-\paragraph{Not every code path carries a correctness argument.}
+\paragraph{What each code path's correctness argument actually is.}
 Each kernel was validated against the CPU reference implementation, but that
-reference is a single-block model, so the multi-block loop at $L = 6$ has no
-independent check. Its only evidence is behavioural: the one-batch overfit
-test still drives the loss to $0.0070$ at $L = 6$. A finite-difference
-gradient check on a tiny multi-block configuration would close the gap and
-has not been run.
-% Vadam's optimiser kernels have their own open validation question. It is
-% under investigation; state it here once that closes, alongside the
-% Vadam subsection in Section~\ref{sec:m:vadam}.
+reference is a single-block model, so it says nothing about the block loop at
+$L > 1$. That gap is closed separately by a finite-difference gradient check
+on a two-block configuration, run per parameter group and per block, which
+agrees to $\sim\!10^{-4}$ relative --- the same error the single-block
+configuration shows, which is the argument, rather than a threshold being
+cleared. Vadam's optimiser kernels carry two more: a double-precision host
+reference for the update, and a distributional test of the sampler over
+$20{,}000$ draws that checks the marginal variances and the absence of
+off-diagonal correlation. Those checks are why
+Section~\ref{sec:quality} attributes that arm's posterior to $N s$ against
+$\lambda$ rather than to a bug. None of this covers the fused
+FlashAttention kernels beyond the CPU reference, and none of it is a proof.
 
 \paragraph{The arms are not identical in what they cover.}
 The low-rank arm places its posterior over the four GEMM weight matrices per
