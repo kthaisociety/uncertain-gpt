@@ -1,35 +1,33 @@
 \section{Limitations}
 \label{sec:limitations}
 
-% The same facts as before, reframed for a mechanism claim: what a cost result at
-% this scale does and does not transfer, what the thermal fault bounds, and which
-% comparisons are confounded.
+% The same facts as before: what a cost measurement at this scale does and does
+% not transfer, what the thermal fault bounds, and which comparisons are
+% confounded. Nothing here is softened because the framing changed.
 
 \paragraph{The scale bounds the milliseconds, not the counts.}
 $11{,}061{,}531$ parameters on a $6$\,GB card, picked so all four arms fit at once.
 Touch counts do not depend on $P$, and neither does the flat numerator of
-Section~\ref{sec:cost:flat}, but every millisecond and every GB/s here belongs to this
+Section~\ref{sec:find:flat}, but every millisecond and every GB/s here belongs to this
 card. Where the network becomes token-bound does depend on the model: a larger one
-saturates the card at a smaller $B$ and reaches the $1/B$ regime sooner. The vocabulary
-of $27$ keeps the token embedding negligible, so nothing covers a posterior over a
-large embedding table.
+saturates the card at a smaller $B$. The vocabulary of $27$ keeps the token embedding
+negligible, so nothing covers a posterior over a large embedding table.
 
 \paragraph{The measurement is bounded by the card and by one axis.}
 The card throttles, so the two sweeps are comparable only to about $1\%$: with
 per-point cooldown the later one still started a few degrees warmer. That is what the
-unchanged control arm is for, it is where the band of
-Section~\ref{sec:cost:crossover} comes from, and no claim in
-Section~\ref{sec:cost:fusion} rests on a difference smaller than it. The low-rank arm
-at $B = 256$ allocated with $248$\,MB of $6144$\,MB free and then ran at about four
-times what its own curve predicts, because past a couple of hundred megabytes of
-headroom the driver backs allocations with host memory; on WSL2
-\texttt{cudaMalloc} succeeds in that state, so the guard is a headroom floor and that
-arm's sweep ends at $B = 128$. The sweep also varies $B$ at $T = 64$ throughout, so
-what is measured is a dependence on batch size and not on tokens per step. One training
-run per arm, no seed sweep, no error bars, and three backward kernels accumulate with
-\texttt{atomicAdd}, so training is not bit-reproducible in principle; normal-mode runs
-at this configuration do reproduce, which is what the trajectory check of
-Section~\ref{sec:quality} uses, and one-batch overfit runs do not.
+unchanged control arm is for, it is where the band of Section~\ref{sec:find:fusion}
+comes from, and no claim in that section rests on a difference smaller than it. The
+low-rank arm at $B = 256$ allocated with $248$\,MB of $6144$\,MB free and then ran at
+about four times what its own curve predicts, because past a couple of hundred
+megabytes of headroom the driver backs allocations with host memory; on WSL2
+\texttt{cudaMalloc} succeeds in that state, so that arm's sweep ends at $B = 128$. The
+sweep varies $B$ at $T = 64$ throughout, so what is measured is a dependence on batch
+size and not on tokens per step. One training run per arm, no seed sweep, no error
+bars, and three backward kernels accumulate with \texttt{atomicAdd}, so training is
+not bit-reproducible in principle; normal-mode runs at this configuration do
+reproduce, which is what the trajectory check of Section~\ref{sec:verification} uses,
+and one-batch overfit runs do not.
 
 \paragraph{The quality comparison is confounded and unconverged.}
 $100{,}000$ steps at $256$ tokens per step is $28\%$ of one epoch, so every quality
@@ -37,7 +35,7 @@ number is what a method does at a fixed step budget. Loss tracks the injected no
 scale monotonically across arms, so an arm that samples less aggressively looks better
 on predictive metrics for a reason unrelated to its posterior, and the
 off-distribution stream is uniform-random ids rather than shifted text, supporting no
-comparison with the shift literature \citep{ovadia2019trust}. The low-rank
-arm is Bayesian over $96\%$ of the model and the ensemble evaluates at $S = E = 5$, so
-a mixture metric read across arms compares different coverage and different sample
+comparison with the shift literature \citep{ovadia2019trust}. The low-rank arm is
+Bayesian over $96\%$ of the model and the ensemble evaluates at $S = E = 5$, so a
+mixture metric read across arms compares different coverage at different sample
 counts.

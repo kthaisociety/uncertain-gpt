@@ -1,24 +1,37 @@
 \section{Introduction}
 \label{sec:intro}
 
-% The mechanism claim, then the implementation that makes it measurable. No
-% results in this section. No claims about the field: this paper may state what
-% it measured and what a cited work says.
+% The comparability problem, the suite as the answer, the findings previewed as
+% demonstrations of what it surfaces. No results beyond the preview. No claims
+% about the field: this paper may state what it measured, what it holds fixed,
+% and what a cited work says.
 
-A step of Bayesian training on a GPU costs what its optimiser moves. Every
-parameter-sized kernel here runs at the card's memory bandwidth, so a posterior's
-per-step price reduces to two counts: how many parameter-sized buffers the method keeps,
-and how many times a step reads or writes each. Neither count contains the batch
-size.
+A training step's cost is a property of an implementation as much as of a method.
+Two Bayesian methods timed in two codebases differ in their kernels, their data path,
+their optimiser constants and their precision, and a gap in step time between them is
+attributable to no one of those.
 
-Four optimisation strategies are implemented over one network to make those counts
-measurable. Bayes-by-Backprop \citep{blundell2015weight}, Vadam
-\citep{khan2018vadam}, a learned low-rank-plus-diagonal Gaussian covariance and a
-five-member deep ensemble \citep{lakshminarayanan2017simple} share a single CUDA
-implementation of a GPT-2 \citep{radford2019language}: the same kernels, the same
-forward and backward pass, the same batches in the same order, the same AdamW
-hyperparameters, the same precision. Each arm's source file holds only what it stores
-and how it updates it, and the ensemble stores no posterior, so every buffer the other
-three add is attributable to their optimiser. Every region of every step is bracketed
-by CUDA events at the launch sites, so each arm's Bayesian work is timed rather than
-inferred as a difference against a baseline.
+uncertain-gpt holds all of them fixed. One CUDA implementation of a GPT-2
+\citep{radford2019language} supplies the kernels, the forward and backward pass,
+the dataloader, the checkpoint format, the timing harness and the evaluation
+harness. A method enters as an update kernel and a callback that returns posterior
+draw $s$, and inherits the rest, so two arms differ only in what they store and how
+many passes they make over that store. Sharing kernels requires owning them: a
+framework supplies the optimiser, the allocator and the choice of kernel, which are
+the terms a shared implementation exists to remove, so the network is written from
+scratch in C and CUDA and every kernel outside cuBLAS is checked against a
+single-threaded C reference.
+
+The four arms implemented against that shared code are methods from published work
+rather than stand-ins for them: Bayes-by-Backprop \citep{blundell2015weight}, Vadam
+\citep{khan2018vadam}, a learned low-rank-plus-diagonal Gaussian covariance, and a
+five-member deep ensemble \citep{lakshminarayanan2017simple} as the control, which
+stores no posterior and therefore prices what the other three add.
+
+Section~\ref{sec:findings} reports four measurements on them. Two are readings a
+count of an arm's buffers implies and the suite confirms: a posterior's per-step cost
+is flat to within $1.5\%$ across a $256$-fold batch sweep, and folding an arm's
+parameter-sized passes into one kernel returns time in proportion to the traffic it
+deletes, which for Vadam is nothing. Two are properties of the posteriors themselves:
+Vadam's fitted posterior at this scale is the prior it started from, and an epistemic
+term is biased low until its sample count converges, at an $S$ that differs by arm.

@@ -1,0 +1,35 @@
+\section{Verification}
+\label{sec:verification}
+
+% What the three instruments of Section~\ref{sec:suite} returned for the change
+% measured here, weakest first, and what the identity assertion does NOT
+% certify. The restraint in the last paragraph is load-bearing: the identity
+% was passed at 1e-15 by two deliberately broken inputs.
+
+Folding is a claim about an implementation, so the numbers of
+Section~\ref{sec:find:fusion} rest on gates a wrong fold fails. Evaluation at
+$S = 32$ on validation and test is byte-identical before and after on all four arms,
+and is the weakest of the three: it draws with the unfused sample kernels, none of
+which folding touches, so a training path could be arbitrarily wrong and this would
+still pass. What it establishes is that the inference path and the
+checkpoints were not disturbed. Running each fused kernel and the kernels it replaces
+on identical inputs leaves mean-field and Vadam bit-identical on every output buffer
+and the low-rank arm within $1.00$ ULP, scored at the larger of a value's own
+magnitude and the buffer's RMS; rebuilding with multiply-add contraction disabled
+makes all three bit-identical, which puts the residual in contraction rather than in
+the arithmetic. And $100$ steps of normal-mode training against the pre-folding source
+reproduce every printed step line on all four arms, including both summary lines of
+the control, whose in-training output is the reference the repository is calibrated
+against.
+
+The identity of Equation~\ref{eq:decomp} is asserted at $10^{-5}$ in double precision
+on every evaluation and the process exits nonzero on a violation; the worst residual
+behind any number in this paper is $4.4 \times 10^{-15}$. It certifies less than that
+suggests. Both halves of the right-hand side are computed directly rather than one
+from the other, so a violation is an error in the accumulation. But the identity is
+normalisation-free, since $\bar{p}$ is the mean of the very vectors it is checked
+against, and it therefore holds for any non-negative vectors: an unnormalised
+probability row and a stale sample buffer were both injected into the harness and both
+passed at $10^{-15}$ while the metrics printed beside them were wrong. What it tests
+is the fold arithmetic and not the probabilities that entered it. A cheaper selftest
+reaches the same arithmetic first, at $10^{-12}$, but only at $V = 2$ and $S \leq 2$.

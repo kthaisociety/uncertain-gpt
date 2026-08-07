@@ -1,9 +1,11 @@
 # paper/
 
-The uncertain-gpt paper: what a Bayesian posterior costs per training step,
-why, and how much of that cost is removable. Each section file opens with the
-guiding comment for its own scope, and **every number reaches the PDF through
-`tables/`, never by hand.**
+The uncertain-gpt paper: here is the benchmark suite, and here is what was
+found using it. The suite is the contribution and each finding is a
+demonstration of what it surfaces; `../docs/adding-an-arm.md` is the long form
+of the "Adding an arm" section and must not drift from it. Each section file
+opens with the guiding comment for its own scope, and **every number reaches
+the PDF through `tables/`, never by hand.**
 
 ## Build
 
@@ -65,7 +67,7 @@ batch size at which what folding returns stops being separable from drift.
 The threshold is **not a chosen round number**. The control arm's code is
 identical in both sweeps, so what it reproduces of itself is the floor on what
 either sweep can resolve, and that is `DRIFT_BAND` — 1%, the same band the
-prose of `sec:cost:fusion` states. The generator checks the constant against
+prose of `sec:find:fusion` states. The generator checks the constant against
 the control's own before/after rows and says so on stderr if the sweeps ever
 drift wider than the band the table calls drift. Two cells are rendered as
 bounds rather than as a batch size, because the sweep is octaves and does not

@@ -1,0 +1,177 @@
+\section{What the suite shows}
+\label{sec:findings}
+
+% Four measurements the suite reports on the four reference arms, in this
+% order: the posterior's cost is fixed per step and its share therefore falls,
+% folding returns the redundant traffic and nothing else, Vadam's fitted
+% posterior is its prior, and an epistemic term depends on the S it was read
+% at. The last two get the room; the first two are demonstrations that the
+% instrument separates arms a pass count separates, and are held short.
+% Interpret the tables; do not retype them, and do not stage or rank them.
+
+\subsection{A posterior's per-step cost does not contain the batch size}
+\label{sec:find:flat}
+
+Each arm's posterior work costs the same milliseconds at $64$ tokens per step as at
+$16{,}384$: across the $256$-fold sweep the directly timed Bayesian regions hold to
+within $1.5\%$ of themselves on every arm (Table~\ref{tab:posterior}), the width of
+the measurement and not a trend in it. Nothing in those regions has a token in it.
+
+The network's cost grows with tokens and the posterior's does not, so the
+posterior's share of a step falls, at a local exponent of $1.005$ for mean-field
+over the last two points. That asymptote is not the whole curve: between $B = 1$ and
+$B = 2$ the exponent is $0.148$ for mean-field and $0.196$ for Vadam, because the
+network is not $O(B \cdot T)$ at the bottom of the sweep either, twice the tokens
+costing the control arm a factor of $1.16$ there and a factor of two from $B = 16$
+up (Table~\ref{tab:amortization}). Nor is the fixed numerator a property of
+posteriors: the control's own parameter-sized share falls just as far.
+
+What fails to amortise is state not proportional to the parameter count, which is
+why the low-rank arm still owns $11.65\%$ of a step at its largest measurable batch
+where mean-field owns $0.75\%$ and Vadam $0.31\%$. All of it is per-step cost,
+pricing neither the ensemble's training runs nor a variational arm's evaluation
+passes.
+
+\begin{table}[t]
+  \centering
+  \resizebox{\linewidth}{!}{\input{\generated/tab-posterior}}
+  \caption{Each arm's own Bayesian work, timed at the launch sites, unfused. Share is
+  the posterior over the whole step, $k$ the exponent in $\text{share} \propto B^{-k}$
+  across the two smallest and the two largest points.}
+  \label{tab:posterior}
+\end{table}
+
+\begin{table}[t]
+  \centering
+  \resizebox{\linewidth}{!}{\input{\generated/tab-amortization}}
+  \caption{The batch sweep for the shipped code. $O(P)\%$ is all parameter-sized work
+  over the step, Bayesian or not; the ensemble column is one member.}
+  \label{tab:amortization}
+\end{table}
+
+\subsection{Folding returns the redundant traffic and nothing else}
+\label{sec:find:fusion}
+
+Folding an arm's parameter-sized passes into one kernel buys time in proportion to the
+traffic it deletes. Mean-field's $32$ touches drop to $15$ for $1.76\times$ of $O(P)$
+time at $B = 1$, the low-rank arm's $122$ per layer to $58$ for $1.14$ to
+$1.16\times$, and Vadam's $11$ to $9$ for between $0.98$ and $1.04\times$
+(Table~\ref{tab:fusion}). The control's code is unchanged in both sweeps and comes out
+within $1\%$ of itself, so that band is drift, and Vadam's result sits inside it.
+
+Vadam's pass count predicted that null before the sweep ran. Two touches of slack
+against a floor of $9$ is $1.22\times$ of traffic, and a fused kernel gives back
+bandwidth: mean-field's streams eight buffers at once where the sequence it replaced
+walked three or four each (Table~\ref{tab:bandwidth}). At that discount a $2.13\times$
+traffic cut is still $1.76\times$ of time and a $1.22\times$ cut is nothing.
+
+What folding returns is a fixed count of buffer touches, so it amortises exactly as
+the posterior's own cost does: the same $1.76\times$ is a fifth of a mean-field step
+at $B = 1$ and under a percent of one at $B = 128$ (Table~\ref{tab:crossover}). Taking
+the boundary per arm at the $1\%$ the control reproduces itself in, mean-field crosses
+at $B = 128$, Vadam is inside that band throughout, and the low-rank arm is outside it
+wherever this card can run.
+
+\begin{table}[t]
+  \centering
+  \resizebox{\linewidth}{!}{\input{\generated/tab-fusion}}
+  \caption{Parameter-sized work before and after folding, where both sweeps measured
+  the point. The ensemble's code is identical in both, so its rows are the drift.}
+  \label{tab:fusion}
+\end{table}
+
+\begin{table}[t]
+  \centering
+  \resizebox{\linewidth}{!}{\input{\generated/tab-crossover}}
+  \caption{Where folding stops being separable from drift. What it returns is $O(P)$
+  time deleted, over the unfused step; $B^\ast$ is the first batch size measured at
+  which that lands inside the control's band, or a bound where the sweep never
+  brackets it.}
+  \label{tab:crossover}
+\end{table}
+
+\subsection{Vadam's fitted posterior is its prior}
+\label{sec:find:vadam}
+
+What the arms return at a fixed budget of $100{,}000$ steps is read from their
+checkpoints, on both splits with neither preferred. The ensemble has the best mixture
+NLPD and the worst ECE by close to a factor of two and Vadam holds the opposite corner
+(Table~\ref{tab:quality}), with mean-field and the low-rank arm between them, no
+ranking being claimed on the NLPD column: with one run per arm, nothing here measures
+the noise floor its spread would have to clear.
+
+A larger epistemic term is not a better posterior. Vadam's in-distribution epistemic
+is $0.0372$ nats on validation against mean-field's $0.0107$
+(Table~\ref{tab:uncertainty}), more than three times it, while its separation between
+in- and off-distribution input sits with the other variational arms at $1.207$
+(Table~\ref{tab:ood}). The spread is the prior's. Equation~\ref{eq:vadam-sigma} weighs
+the data's contribution to the precision, $N s$, against $\lambda = 2500$, so the
+per-token RMS gradient would have to reach $\sqrt{\lambda / N} = 5.27 \times 10^{-3}$
+where the median observed value is $2.71 \times 10^{-5}$, short by
+$195\times$.\footnote{Read from the trained checkpoint by
+\texttt{dev/vadam\_posterior.py}, the one measurement here taken from a checkpoint
+rather than a logged run.} At that median the data supplies $0.0026\%$ of the
+precision and $99.8\%$ of parameters sit within $10\%$ of the prior standard
+deviation; the minibatch bias of that paper's own Theorem~1 accounts for at most
+$16\times$ of the shortfall on the gradient scale, and correcting for it in full moves
+that $99.8\%$ to $85.1\%$.
+
+The mean did fit: $\mu$ ends at correlation $0.083$ with its initialisation, having
+moved $1.27$ times its own initial norm. What the width reports is the threshold
+$\lambda = 1/\sigma_{\text{init}}^{2}$ sets against this model's gradients, not a run
+that failed to train, and noise that does not shrink as the mean fits is why that arm
+fails the one-batch memorisation gate.
+
+\begin{table}[t]
+  \centering
+  \input{\generated/tab-quality}
+  \caption{Predictive quality, in nats, over $16{,}384$ positions. ``Single draw'' is
+  one posterior sample, or member $0$ for the ensemble: comparable within an arm, not
+  across them.}
+  \label{tab:quality}
+\end{table}
+
+\begin{table}[t]
+  \centering
+  \input{\generated/tab-uncertainty}
+  \caption{In-distribution decomposition, in nats, by Equation~\ref{eq:decomp}. The
+  worst residual against the asserted identity behind any number here is
+  $4.4 \times 10^{-15}$.}
+  \label{tab:uncertainty}
+\end{table}
+
+\begin{table}[t]
+  \centering
+  \input{\generated/tab-ood}
+  \caption{Epistemic uncertainty on the off-distribution stream, in nats, stated once
+  per arm: the stream is one fixed synthetic sequence, so only the ratio's denominator
+  is split-dependent.}
+  \label{tab:ood}
+\end{table}
+
+\subsection{An epistemic term is a Monte Carlo estimate at some $S$}
+\label{sec:find:s}
+
+Every uncertainty number above carries its $S$, because the estimator is an average
+over $S$ draws and biased low until it converges (Figure~\ref{fig:s-convergence}). At
+$S = 1$ it is exactly zero by construction, one sample disagreeing with nothing, and
+it approaches the converged value from below. Where it converges is a property of the
+arm rather than of the harness: mean-field is flat by $S = 32$ and confirmed flat to
+$S = 128$, though its ECE rises at every doubling over that range while its mixture
+NLPD improves, and the low-rank arm gains a few percent of epistemic between $S = 32$
+and $S = 64$, so whether the convention moves to $S = 64$ is open.
+
+The ensemble cannot be read at an $S$ of anyone's choosing. Its $s$-th sample is its
+$s$-th trained member, so $S$ is capped at $E = 5$ and a further draw costs a training
+run rather than a forward pass. Tables~\ref{tab:uncertainty} and \ref{tab:ood} state
+it at $S = 5$ beside variational arms at $S = 32$, and every epistemic term compared
+across those rows carries that difference.
+
+\begin{figure}[t]
+  \centering
+  \input{\generated/fig-s-convergence}
+  \caption{Epistemic uncertainty against posterior samples $S$, validation split. The
+  foot at $S = 1$ is exactly zero by construction; the ensemble is a marked point at
+  the members it was paid to train.}
+  \label{fig:s-convergence}
+\end{figure}

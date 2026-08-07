@@ -211,13 +211,18 @@ them.
 `paper/` — see `paper/README.md` for build, table regeneration, and the
 venue-template swap.
 
-**The paper is a systems paper about optimisation cost, not a comparison of
-posteriors.** Its thesis is that a Bayesian posterior's training cost is memory
-traffic over parameter-sized buffers: fixed per step, therefore amortising with
-batch size, and removable in proportion to the redundant traffic. The four arms
-are four optimisation strategies with different cost structures, and the quality
-numbers are kept but demoted to "what did the cost buy". A draft that ranks
-posteriors has lost the thesis; that framing was rejected once already.
+**The paper is a benchmark-suite paper: here is the suite, and here is what
+was found using it.** The suite is the contribution and each finding is a
+demonstration of what it surfaces, so the bar on a finding is "does this show
+the instrument separates real differences", not "is this surprising". Two
+framings were rejected before this one: ranking posteriors, and a mechanism
+claim in which every result had to be interesting standalone. The shared CUDA
+is load-bearing and the paper says so — comparisons are incomparable when each
+method runs on different code, and you cannot share kernels you do not own.
+The four arms are reference implementations of published methods, and the
+quality numbers are kept but demoted. `docs/adding-an-arm.md` is the long form
+of the paper's "Adding an arm" section and the two must not drift apart; a
+suite nobody can extend is not a suite.
 
 One rule holds everywhere: **no number is ever typed into the paper.** Cost and
 quality tables are generated from `runs/` into `paper/tables/generated/`, and a
@@ -249,7 +254,7 @@ calls drift. `tab-cost.tex` is still generated as the training-run record but is
 no longer `\input`: its `ms/step` predates the `bench_*` protocol that
 supersedes it.
 
-The prose is held near 4,000 words, with no em-dashes, no first person and no
+The prose is held near 4,200 words, with no em-dashes, no first person and no
 bullet lists, and the count that budget refers to is
 
     cd paper && cat main.tex sections/*.tex | grep -v '^\s*%' | wc -w

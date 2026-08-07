@@ -5,6 +5,13 @@
 %  every number reaches the PDF through paper/tables/, never by hand.
 %  See paper/README.md.
 %
+%  This is a benchmark-suite paper. The suite is the contribution and the
+%  measurements are what it reports; a draft in which a finding has to be
+%  surprising on its own has lost the framing. Sections run: the
+%  comparability problem, the suite, the reference arms, what the suite
+%  measured, what the numbers are gated on, what they do not cover, and how
+%  to add an arm.
+%
 %  Venue swap: replace ONLY the \documentclass line below (and add the
 %  venue .sty next to this file). Nothing else in this file is
 %  class-specific; preamble.tex is deliberately class-agnostic.
@@ -13,7 +20,7 @@
 
 \input{preamble}
 
-\title{A posterior's training cost is memory traffic over\\parameter-sized buffers}
+\title{uncertain-gpt: a shared-kernel benchmark suite for\\the training cost of Bayesian deep learning}
 \author{Tage Sköldefors}
 % Literal, not \today: CI pins SOURCE_DATE_EPOCH=0 so \today renders as
 % January 1, 1970 in the committed PDF. Bump this by hand when the draft moves.
@@ -23,39 +30,39 @@
 \maketitle
 
 \begin{abstract}
-% The mechanism claim, the measurement that carries it, and the caveat that
-% keeps it honest. The controlled implementation is what makes the cost
-% separable, not a contribution in itself. Every number here is a cell in a
-% generated table or a constant from the source.
-What a Bayesian posterior costs per training step, on a GPU, is the bytes its
-optimiser moves over parameter-sized buffers, and that quantity does not depend on
-how many tokens the step processes. Bayes-by-Backprop, Vadam, a learned
-low-rank-plus-diagonal Gaussian covariance and a five-member deep ensemble are
-implemented as four optimisation strategies over one CUDA GPT-2 of $11{,}061{,}531$
-parameters, sharing kernels, batches, optimiser constants and precision, so an arm
-differs only in what it stores and how many passes it makes over that store. Timed
-region by region with CUDA events across a $256$-fold batch sweep at fixed sequence
-length, each arm's posterior work holds to within $1.5\%$ of itself while tokens per
-step go from $64$ to $16{,}384$. Its share of the step therefore falls towards
-$1/B$, at a local exponent of $1.005$ for Bayes-by-Backprop at $B = 256$, but not
-below $B \approx 16$, where the network's own forward and backward pass is
-launch-bound rather than token-bound: $1/B$ is the asymptote and not the curve.
-Folding each arm's parameter-sized passes into one kernel cuts Bayes-by-Backprop's
-$O(P)$ time by $1.76\times$ and leaves Vadam's inside measurement drift, which its
-pass count predicts: $11$ buffer touches per step against a floor of $9$. Evaluation
-at $S = 32$ is byte-identical across that change on all four arms, and the fused
-kernels are bit-identical to the ones they replace with multiply-add contraction
-disabled.
+% The suite first, then what it reported on the arms. Not a mechanism claim:
+% the instrument is the contribution and the four measurements are readings
+% off it. Every number here is a cell in a generated table or a constant from
+% the source.
+uncertain-gpt is a benchmark suite for what a Bayesian deep learning method costs to
+train. One CUDA implementation of a GPT-2 of $11{,}061{,}531$ parameters supplies the
+kernels, the forward and backward pass, the dataloader, the checkpoint format, the
+timing harness and the evaluation harness, and the AdamW constants, the batch order
+and fp32 arithmetic are shared as well, so an arm differs from every other arm only in
+what it stores and how many passes it makes over that store. A method enters as an
+update kernel and a callback returning posterior draw $s$. Bayes-by-Backprop, Vadam, a
+learned low-rank-plus-diagonal Gaussian covariance and a five-member deep ensemble are
+the reference arms, each a method from published work. Across a $256$-fold batch sweep
+at fixed sequence length, each arm's posterior work holds to within $1.5\%$ of itself
+while tokens per step go from $64$ to $16{,}384$, so its share of the step falls
+towards $1/B$ above $B \approx 16$ and more slowly below it, where the network's own
+passes are launch-bound rather than token-bound. Folding an arm's parameter-sized
+passes into one kernel cuts Bayes-by-Backprop's $O(P)$ time by $1.76\times$ and leaves
+Vadam's inside the $1\%$ band the unchanged control arm reproduces itself in, which
+Vadam's $11$ buffer touches per step against a floor of $9$ predicted before the sweep
+ran. Vadam's fitted posterior at this scale is the prior it started from, and an
+epistemic term is biased low until its sample count converges, at an $S$ that differs
+by arm.
 \end{abstract}
 
 \input{sections/introduction}
 \input{sections/related-work}
+\input{sections/suite}
 \input{sections/methods}
-\input{sections/setup}
-\input{sections/cost-results}
-\input{sections/quality-results}
-\input{sections/discussion}
+\input{sections/findings}
+\input{sections/verification}
 \input{sections/limitations}
+\input{sections/adding-an-arm}
 
 % The prose now cites for real, so \nocite{*} is gone. Every entry in
 % references.bib is cited from the body; `make -C paper` is clean of

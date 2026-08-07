@@ -1,25 +1,21 @@
-\section{Four optimisation strategies over one network}
-\label{sec:methods}
+\section{Reference implementations}
+\label{sec:arms}
 
-% Per the brief for this section: what each arm stores, how many parameter-sized
-% passes a step makes over that store, and what that buys. Pass counts belong
-% here; their measured cost belongs in Section~\ref{sec:cost}. The arms'
-% mathematics is in the cited papers and in the repository, not restated here.
+% The four arms as optimisation strategies: what each stores, how many
+% parameter-sized passes a step makes over that store, and what that buys. Pass
+% counts belong here; their measured cost belongs in Section~\ref{sec:findings}.
+% The arms' mathematics is in the cited papers and in the repository, not
+% restated here.
 
-The shared header holds the kernels, buffer layout, forward and backward pass,
-dataloader, checkpoint format and evaluation harness; each arm's source file holds only
-its optimiser. Cost is counted there in \emph{touches}, one read or one write of a
-parameter-sized buffer in a step, which at $P = 11{,}061{,}531$ parameters in fp32 is
-$44.2$\,MB. A deterministic AdamW step costs eight: a gradient zeroed and read, weights
-and two moments each read and written.
-
-Each arm is counted twice below, as the passes the method needs and as the passes left
-after the redundant ones are folded into one kernel. One observation does most of that
-folding in all three Bayesian arms: a gradient accumulator for a variational parameter
-is write-only, so it never has to reach memory and becomes a register, and the next
-step's draw folds in with it as a function of the parameters the update just wrote. The
-fold is gated as an implementation of the same arithmetic
-(Section~\ref{sec:quality}).
+Four methods are implemented against the shared code of Section~\ref{sec:suite},
+each counted twice below: the passes the method needs, and the passes left after the
+redundant ones are folded into one kernel. At $P = 11{,}061{,}531$ parameters in fp32
+a touch is $44.2$\,MB, and a deterministic AdamW step costs eight: a gradient zeroed
+and read, weights and two moments each read and written. One observation does most of
+the folding in all three Bayesian arms. A gradient accumulator for a variational
+parameter is write-only, so it becomes a register rather than reaching memory, and
+the next step's draw folds in with it as a function of the parameters the update just
+wrote.
 
 \paragraph{Bayes-by-Backprop.}
 A fully factorised Gaussian, drawn as $w_i = \mu_i +
@@ -28,15 +24,14 @@ reparameterised so the gradient reaches both moments
 \citep{kingma2014autoencoding,blundell2015weight}, against a prior of standard
 deviation $0.1$ under an ELBO whose KL weight is $1/N$ for $N$ the training token
 count, read off the loader rather than tuned. It stores $\mu$, $\rho$ and an AdamW
-moment pair for each, where a deterministic model stores weights and one pair, and
-runs AdamW twice a step: eight launches and $32$ touches over ten buffers, the most
-of the four. Folding leaves one launch and $15$ touches over eight, the floor its
-state implies.
+moment pair for each, and runs AdamW twice a step: eight launches and $32$ touches
+over ten buffers. Folding leaves one launch and $15$ touches over eight, the floor
+its state implies.
 
 \paragraph{Vadam.}
 Adam's second moment already estimates a curvature, so \citet{khan2018vadam} reuse
-it as the posterior precision and allocate nothing for the posterior. The mean
-alone is free and the scale is read off the optimiser,
+it as the posterior precision and allocate nothing for the posterior. The scale is
+read off the optimiser,
 \begin{equation}
   \sigma_i = \frac{1}{\sqrt{N s_i + \lambda}} ,
   \qquad
@@ -45,25 +40,23 @@ alone is free and the scale is read off the optimiser,
 \end{equation}
 with $\lambda = 1/\sigma_{\text{init}}^{2} = 2500$ the prior precision, the
 initialisation rather than a tuned value, and the square root absent from $\sigma$
-following that paper's footnote~2. Its update is Figure~1 of the same paper transcribed
-unchanged, one Adam step with the prior folded into the gradient, so the state is $\mu$
-with Adam's own $m$ and $s$: three launches and $11$ touches against a floor of $9$, two
-touches of slack and no accumulator to delete.
+following that paper's footnote~2. Its update is Figure~1 of the same paper
+transcribed unchanged, one Adam step with the prior folded into the gradient, so the
+state is $\mu$ with Adam's own $m$ and $s$: three launches and $11$ touches against a
+floor of $9$, two touches of slack and no accumulator to delete.
 
 \paragraph{Low-rank plus diagonal covariance.}
 This arm buys correlation with memory. The covariance is $\Sigma = A A^{\top} +
 \mathrm{diag}(d^{\,2})$ at rank $r = 8$, never formed, and a draw is $w_i = \mu_i +
 \sum_{k<r} A_{ik} z_k + d_i \varepsilon_i$ with one $z \sim \mathcal{N}(0, I_r)$ per
-weight matrix per forward pass, shared by all $P$ of its weights; that shared draw
-is the coupling, and the KL reaches $\log\det \Sigma$ through an $r \times r$
-determinant. The posterior covers the four GEMM weight matrices per block, $24$
-tensors holding $10{,}616{,}832$ parameters. Counted per Bayesian layer in units of
-that layer's parameter count, so that $A$ counts as $r$, it costs two launches per
+weight matrix per forward pass, shared by all of that matrix's weights, which is the
+coupling; the KL reaches $\log\det \Sigma$ through an $r \times r$ determinant. The
+posterior covers the four GEMM weight matrices per block, $24$ tensors holding
+$10{,}616{,}832$ parameters. Counted per Bayesian layer in units of that layer's
+parameter count, so that $A$ counts as $r$, it costs two launches per
 layer plus four global, $122$ units at $r = 8$, folding to one launch per layer and
 $58$. It is the one arm left above its floor: its KL setup goes through a cuBLAS
-call per layer and a Cholesky on the host, so it cannot fold into the update it
-feeds, needs a reduction over each layer rather than one index, and round-trips $r
-\times r$ matrices.
+call per layer and a host Cholesky, so it cannot fold into the update it feeds.
 
 \paragraph{Deep ensemble (control).}
 $E = 5$ deterministic models \citep{lakshminarayanan2017simple} differing only in
@@ -71,8 +64,7 @@ the initialisation seed, which with no dropout and a sequential loader is the on
 source of diversity; member probabilities are averaged at inference, never logits.
 The arm stores no posterior and introduces no kernels, so its step is the
 deterministic two launches and eight touches, already at the floor. It is left
-unfused on purpose: its in-training output is the reference the repository is
-calibrated against and its code is identical in both sweeps, which makes it the
-drift control in Section~\ref{sec:cost}. Its cost sits elsewhere: $E$ times the step,
-$E$ times the memory, $E$ training runs, and an evaluation sample count capped at the
-members it trained.
+unfused on purpose: its code is then identical in both sweeps, which makes it the
+drift control in Section~\ref{sec:findings}. Its cost sits elsewhere, in $E$ times
+the step, $E$ times the memory, $E$ training runs, and an evaluation sample count
+capped at the members it trained.

@@ -15,15 +15,15 @@ Bayes-by-Backprop by \citet{blundell2015weight} through the reparameterisation o
 \citet{kingma2014autoencoding}, which pays for a posterior with a second
 parameter-sized tensor and a second optimiser state; \citet{wen2018flipout} move a
 per-example perturbation into the activations. \citet{khan2018vadam} instead reuse
-Adam's second moment as a posterior precision and allocate nothing beyond it,
-\citet{osawa2019practical} scale natural-gradient variational inference to ImageNet,
-and \citet{shen2024ivon} apply it at GPT-2 scale. Covariances fitted after training
-move the cost out of the step: a Kronecker-factored Laplace approximation at a
-trained point \citep{ritter2018scalable}, the same approximation as a recipe
+Adam's second moment as a posterior precision, \citet{osawa2019practical} scale
+natural-gradient variational inference to ImageNet, and \citet{shen2024ivon} apply it
+at GPT-2 scale. Covariances fitted after training move the cost out of the step: a
+Kronecker-factored Laplace approximation at a trained point
+\citep{ritter2018scalable}, the same approximation as a recipe
 \citep{daxberger2021laplace}, and a low-rank-plus-diagonal factor from the SGD
 trajectory \citep{maddox2019swag}, which is the covariance the third arm here learns
 during training instead. Deep ensembles \citep{lakshminarayanan2017simple} keep the
-step deterministic and pay $E$ training runs, and match or beat variational methods
-on the benchmarks of \citet{ovadia2019trust}; MC dropout \citep{gal2016dropout} is
-the other cheap baseline, and this network has no dropout layers. Metrics follow
+step deterministic and pay $E$ training runs, and match or beat variational methods on
+the benchmarks of \citet{ovadia2019trust}; MC dropout \citep{gal2016dropout} is the
+other cheap baseline, and this network has no dropout layers. Metrics follow
 \citet{guo2017calibration} and \citet{kendall2017uncertainties}.

@@ -1,0 +1,30 @@
+\section{Adding an arm}
+\label{sec:adding}
+
+% Part of the contribution, not an appendix: a suite nobody can extend is not a
+% suite. The two functions, the three conventions the shared code depends on,
+% the commands that measure a new arm, and the baseline it compares against.
+% The long form is docs/adding-an-arm.md in the repository; keep this section
+% short enough that it cannot drift from that file.
+
+A method is added by writing two functions in one file. The update kernel takes what
+the method stores and the gradient the shared backward pass produced, and writes the
+state and the next step's draw. The \texttt{uq\_sample\_fn} takes a sample index and
+returns a device pointer to draw $s$. The rest is inherited.
+
+Three conventions the shared code depends on, each of which fails silently. An arm's
+\texttt{main} is compiled out when its file is included into the Python extension,
+because four of them cannot coexist in one module, while its kernels and its callback
+stay outside that guard so the module gets the arm's mathematics with no second copy.
+cuBLAS is reached only through an accessor macro, which yields one handle per linked
+image whatever the translation-unit layout. And a fatal path goes through
+\texttt{UNCERTAIN\_ABORT}, \texttt{exit} in a binary and a thrown exception in the
+module, so shared code cannot kill an interpreter.
+
+A new arm is then measured by the commands the four here were: \texttt{bench} at one
+batch size for a point on the sweep, \texttt{bench\_sweep.sh} for the whole of it, and
+\texttt{eval} for the quality and uncertainty columns at a stated $S$ and split.
+Tables~\ref{tab:posterior} and \ref{tab:quality} are the baseline it lands beside.
+\texttt{docs/adding-an-arm.md} in the repository is the long form: which file to copy,
+how the buffer layout is extended, how to count the passes a step makes, and what to
+run before a number from a new arm is reported.

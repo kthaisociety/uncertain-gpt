@@ -2,16 +2,25 @@
   <img src="logo.svg" alt="uncertain-gpt" width="620">
 </p>
 
-A GPT-2 written from scratch in C and CUDA, where the weights are distributions
-instead of numbers. Same network every run; a different sample of it every step.
+A benchmark suite for what a Bayesian deep learning method costs to train. A
+GPT-2 written from scratch in C and CUDA, where the weights are distributions
+instead of numbers, and every method runs on the *same* kernels, the same data
+path, the same optimizer constants and the same precision — so an arm differs
+only in what it stores and how many passes it makes over that store. You cannot
+share kernels you do not own, which is why this is from scratch.
 
-- `gpt2_kernels.cuh` — the network. Kernels, layout, forward, backward, data.
-  Shared by every variant, so a fix lands everywhere at once.
-- One `.cu` per Bayesian method, ~150 lines each, containing *only* how the
-  weights are sampled and updated: Bayes-by-Backprop, Vadam, low-rank + diagonal
-  covariance, and a deep-ensemble control arm.
+- `gpt2_kernels.cuh` — the network and the harnesses. Kernels, layout, forward,
+  backward, data, checkpointing, region timing (`bench_*`) and the uncertainty
+  evaluation (`uq_evaluate`). Shared by every arm, so a fix lands everywhere.
+- One `.cu` per method, ~150 lines each, containing *only* how the weights are
+  sampled and updated: Bayes-by-Backprop, Vadam, low-rank + diagonal covariance,
+  and a deep-ensemble control arm. Each is a method from published work.
 - `train_bnn.c` — the deterministic CPU reference every kernel was checked
   against. `dev/` is where each kernel was built and validated one at a time.
+
+**Adding a method** is two functions — an update kernel and a `uq_sample_fn`
+callback returning posterior draw *s* — in one file:
+**[`docs/adding-an-arm.md`](docs/adding-an-arm.md)**.
 
 ```
 python3 -m venv .venv && .venv/bin/pip install tiktoken numpy tqdm requests
@@ -25,8 +34,9 @@ make test                                       # run every variant, print one t
 
 Built for an RTX 2060 (`sm_75`); override with `make ARCH=sm_XX`.
 
-`paper/` holds the write-up: `make -C paper`. Its tables are generated from
-`runs/`, never typed. Read it here: [`paper/main.pdf`](paper/main.pdf) (CI-built, placeholder tables).
+`paper/` holds the write-up — the suite, and what it found using the suite:
+`make -C paper`. Its tables are generated from `runs/`, never typed. Read it
+here: [`paper/main.pdf`](paper/main.pdf) (CI-built).
 
 ## From Python
 
