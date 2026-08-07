@@ -101,9 +101,9 @@ ranking being claimed on the NLPD column: with one run per arm, nothing here mea
 the noise floor its spread would have to clear.
 
 A larger epistemic term is not a better posterior. Vadam's in-distribution epistemic
-is $0.0372$ nats on validation against mean-field's $0.0107$
+is $0.0381$ nats on validation against mean-field's $0.0108$
 (Table~\ref{tab:uncertainty}), more than three times it, while its separation between
-in- and off-distribution input sits with the other variational arms at $1.207$
+in- and off-distribution input sits with the other variational arms at $1.197$
 (Table~\ref{tab:ood}). The spread is the prior's. Equation~\ref{eq:vadam-sigma} weighs
 the data's contribution to the precision, $N s$, against $\lambda = 2500$, so the
 per-token RMS gradient would have to reach $\sqrt{\lambda / N} = 5.27 \times 10^{-3}$
@@ -152,19 +152,20 @@ fails the one-batch memorisation gate.
 \subsection{An epistemic term is a Monte Carlo estimate at some $S$}
 \label{sec:find:s}
 
-Every uncertainty number above carries its $S$, because the estimator is an average
-over $S$ draws and biased low until it converges (Figure~\ref{fig:s-convergence}). At
-$S = 1$ it is exactly zero by construction, one sample disagreeing with nothing, and
-it approaches the converged value from below. Where it converges is a property of the
-arm rather than of the harness: mean-field is flat by $S = 32$ and confirmed flat to
-$S = 128$, though its ECE rises at every doubling over that range while its mixture
-NLPD improves, and the low-rank arm gains a few percent of epistemic between $S = 32$
-and $S = 64$, so whether the convention moves to $S = 64$ is open.
+Every uncertainty number above carries its $S$: the estimator averages over $S$ draws,
+is exactly zero at $S = 1$ by construction, one sample disagreeing with nothing, and
+approaches its converged value from below (Figure~\ref{fig:s-convergence}). Where it
+converges is a property of the arm rather than of the harness: mean-field is flat by
+$S = 32$ and confirmed flat to $S = 128$, though its ECE rises at every doubling over
+that range while its mixture NLPD improves. Vadam and the low-rank arm are still
+climbing at $S = 32$ and flatten only at $S = 64$, which is why
+Section~\ref{sec:suite}'s convention sits there rather than where mean-field alone
+would put it.
 
 The ensemble cannot be read at an $S$ of anyone's choosing. Its $s$-th sample is its
 $s$-th trained member, so $S$ is capped at $E = 5$ and a further draw costs a training
 run rather than a forward pass. Tables~\ref{tab:uncertainty} and \ref{tab:ood} state
-it at $S = 5$ beside variational arms at $S = 32$, and every epistemic term compared
+it at $S = 5$ beside variational arms at $S = 64$, and every epistemic term compared
 across those rows carries that difference.
 
 \begin{figure}[t]

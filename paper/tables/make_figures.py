@@ -28,6 +28,10 @@ THE S=1 INVARIANT: one sample disagrees with nothing, so epistemic at S=1
 must be exactly zero. It is the sanity check of the whole plot. If it is not
 exactly zero this script refuses to plot and exits nonzero, rather than
 drawing a curve whose foot is wrong.
+
+The marked S is the suite's evaluation convention and is DERIVED from these
+logs, never typed: see converged_S(). An arm still climbing at the end of the
+range leaves it unmarked instead of settling it on the arms that converged.
 """
 
 import argparse
@@ -38,17 +42,27 @@ from glob import glob
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import make_tables as mt  # noqa: E402  (path must be set first)
 
-# Series colours: slots 1-3 of the validated categorical palette. Validated
-# all-pairs, light surface: worst CVD dE 9.2, worst normal-vision dE 24.0.
-# Aqua sits under 3:1 on white, so every series is also direct-labelled.
-COLORS = {"BBB": "#2a78d6", "LowR": "#eb6834", "Ens": "#1baf7a"}
-MARKERS = {"BBB": "o", "LowR": "s", "Ens": "D"}
+# Series colours: slots 1-4 of the validated categorical palette, in its
+# order. A line chart is scored on the adjacent pairlist, which those four
+# pass: worst adjacent CVD dE 9.1, worst adjacent normal-vision dE 19.6,
+# light surface. Aqua and yellow sit under 3:1 on white, so every series is
+# also direct-labelled.
+COLORS = {"BBB": "#2a78d6", "LowR": "#eb6834", "Ens": "#1baf7a",
+          "Vadam": "#eda100"}
+MARKERS = {"BBB": "o", "LowR": "s", "Ens": "D", "Vadam": "^"}
 # One display name per arm, used by BOTH the direct label and the legend --
 # two names for one series reads as two series.
-NAMES = {"BBB": "BBB", "LowR": "LowR8", "Ens": "Ens5"}
+NAMES = {"BBB": "BBB", "LowR": "LowR8", "Ens": "Ens5", "Vadam": "Vadam"}
 INK, MUTED, RULE = "#3a3a38", "#52514e", "#9a9a95"
-SWEEPABLE = ["BBB", "LowR"]      # arms whose S is a free parameter
-PINNED = "Ens"                   # S is the number of trained members
+SWEEPABLE = ["BBB", "Vadam", "LowR"]   # arms whose S is a free parameter
+PINNED = "Ens"                         # S is the number of trained members
+
+# uq_report prints epistemic with four decimals, so 1e-4 is the finest
+# difference a log can express and there is no tolerance to choose here: an
+# arm has converged at the smallest S from which it and every larger S it was
+# measured at are indistinguishable, at the precision the harness prints,
+# from the largest. Derived from the format string, not tuned.
+EPI_QUANTUM = 1e-4
 
 
 def sweep_points(records):
@@ -70,6 +84,33 @@ def sweep_points(records):
     return out
 
 
+def converged_S(points):
+    """The suite's S, read off the sweep rather than typed: the smallest
+    measured S at which EVERY sweepable arm has converged. None when some arm
+    has not, or was not swept -- a convention no arm's data supports is not
+    one to draw. The slowest arm sets it; reporting below it would state that
+    arm's epistemic term under its own converged value."""
+    per_arm = []
+    for key in SWEEPABLE:
+        pts = points.get(key)
+        if not pts or len(pts) < 2:
+            return None
+        # Compared as printed digits, not as floats: 0.0108 and 0.0107 differ
+        # by one digit and by 1.0000000000000005e-4, and a float comparison
+        # against the quantum would call that a difference.
+        # The largest S measured is never itself the answer, either: it agrees
+        # with itself whatever the curve is doing, so convergence has to be
+        # confirmed by at least one further doubling.
+        digits = lambda e: int(round(e / EPI_QUANTUM))
+        final = digits(pts[-1][1])
+        flat = [pts[i][0] for i in range(len(pts) - 1)
+                if all(abs(digits(e) - final) <= 1 for _, e, _ in pts[i:])]
+        if not flat:
+            return None
+        per_arm.append(flat[0])
+    return max(per_arm)
+
+
 def check_s1(points):
     """Returns a list of violations of the S=1 invariant."""
     bad = []
@@ -81,7 +122,7 @@ def check_s1(points):
     return bad
 
 
-def plot(points, ens, out_pdf, split):
+def plot(points, ens, out_pdf, split, mark):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -113,6 +154,16 @@ def plot(points, ens, out_pdf, split):
                     xytext=(9, 0), color=INK, fontsize=9, va="center",
                     annotation_clip=False)
         drawn.append(PINNED)
+
+    # The convention, drawn where the sweep puts it. It is behind the curves
+    # and labelled in the empty band below them, the one region no series and
+    # no legend occupies.
+    if mark:
+        ax.axvline(mark, color=RULE, linewidth=1, linestyle=(0, (4, 3)),
+                   zorder=1, ymax=0.7)   # stops short of the legend
+        ax.annotate("suite $S = %d$: every sweepable arm converged" % mark,
+                    (mark, 0), textcoords="offset points", xytext=(-6, 6),
+                    color=MUTED, fontsize=8, ha="right", va="bottom")
 
     all_S = sorted({S for pts in points.values() for S, _, _ in pts})
     ax.set_xscale("log", base=2)
@@ -204,11 +255,14 @@ def main():
               "under %s to remake it from" % rel(args.sweep))
         return 0
 
-    note = ("source: %d sweep log(s) under %s, split %s%s"
+    mark = converged_S(points)
+    note = ("source: %d sweep log(s) under %s, split %s%s; suite S %s"
             % (len(sweep_logs), rel(args.sweep), args.split,
-               "" if ens else "; pinned-arm point NOT measured"))
+               "" if ens else "; pinned-arm point NOT measured",
+               mark if mark else "unmarked -- some sweepable arm has not "
+               "converged over the range measured"))
     if have:
-        plot(points, ens, out_pdf, args.split)
+        plot(points, ens, out_pdf, args.split, mark)
     elif os.path.exists(out_pdf):
         os.remove(out_pdf)   # never let a stale figure outlive its data
     mt.write_fragment(out_tex, figure_tex(have, note), mt.stamp(root),
@@ -220,6 +274,7 @@ def main():
             key, len(pts), " ".join("S=%d:%.4f" % (S, e) for S, e, _ in pts)))
     print("make_figures: %-5s %s" % (
         PINNED, "S=%d:%.4f" % ens if ens else "not measured -- omitted"))
+    print("make_figures: suite S %s" % (mark if mark else "unmarked"))
     print("make_figures: %s" % ("wrote " + out_pdf if have
                                 else "no data -> placeholder only"))
     return 0
@@ -241,6 +296,26 @@ def selftest():
     assert len(check_s1(sweep_points([rec("bbb", 1, 1e-9)]))) == 1
     # ...including a value that only *prints* as 0.0000
     assert len(check_s1(sweep_points([rec("bbb", 1, 0.00004)]))) == 1
+    # the suite's S is the SLOWEST sweepable arm's convergence point, and an
+    # arm still climbing at the end of the range leaves it unmarked rather
+    # than settling it on the arms that did converge.
+    def series(arm, ys):
+        return [rec(arm, 2 ** i, y) for i, y in enumerate(ys)]
+
+    fast = series("bbb", [0.0, 0.0090, 0.0107, 0.0107])          # flat from 4
+    vad = series("vadam", [0.0, 0.0300, 0.0381, 0.0382])         # flat from 4
+    slow = series("lowr", [0.0, 0.0100, 0.0150, 0.0171, 0.0171])  # flat from 8
+    assert converged_S(sweep_points(fast + vad + slow)) == 8
+    assert converged_S(sweep_points(fast + vad)) is None   # LowR not swept
+    climbing = series("lowr", [0.0, 0.0100, 0.0150, 0.0200])
+    assert converged_S(sweep_points(fast + vad + climbing)) is None
+    # one printed digit of movement is not movement -- it is all a log of
+    # four decimals can express -- but two is.
+    wiggle = series("lowr", [0.0, 0.0100, 0.0150, 0.0170, 0.0171])
+    assert converged_S(sweep_points(fast + vad + wiggle)) == 8
+    two = series("lowr", [0.0, 0.0100, 0.0150, 0.0169, 0.0171])
+    assert converged_S(sweep_points(fast + vad + two)) is None
+
     # no data -> the macro, never a figure
     t = figure_tex(False, "none")
     assert mt.NA not in t and r"\todo" in t and "includegraphics" not in t, t

@@ -165,6 +165,16 @@ Two invariants the generator enforces, beyond the shared one:
   checkout without `runs/`, where the committed figure is the only
   measurement in existence, so it is kept untouched.
 
+The dashed line on that figure is the suite's *S*, and it is **derived from
+the sweep, not typed**: the smallest measured *S* from which every sweepable
+arm agrees with its own largest-*S* value to within the one printed digit
+`uq_report` resolves (`EPI_QUANTUM`), confirmed by at least one further
+doubling. The rule, not the value, is what `sections/suite.tex` and
+`docs/adding-an-arm.md` state, so an arm that converges later moves the line
+by being swept. If some arm is still climbing at the end of the range the
+line is omitted and the fragment's `% source:` line says so — the question is
+then open, and a figure must not settle it on the arms that did converge.
+
 ## Swapping in a venue template
 
 The preamble is deliberately class-agnostic, so the swap is:

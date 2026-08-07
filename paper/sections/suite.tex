@@ -75,7 +75,10 @@ the decomposition \citep{kendall2017uncertainties}
   \label{eq:decomp}
 \end{equation}
 in nats, in double precision, mixing samples as probabilities and never as logits.
-The off-distribution stream is uniform-random token ids from a fixed seed.
+The off-distribution stream is uniform-random token ids from a fixed seed. $S$ is the
+first value at which every arm free to choose one has converged, $S = 64$ for these
+four; an arm that converges later raises it rather than reporting below its own
+converged value.
 
 \paragraph{What can be proved about a change to the suite.}
 Three instruments, in increasing strength: an evaluation whose output is

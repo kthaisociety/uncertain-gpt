@@ -164,6 +164,42 @@ Evaluate, from the checkpoint, never training:
 total/aleatoric/epistemic decomposition, plus the same on an off-distribution
 stream of uniform-random token ids. Every number carries its `S` and its split.
 
+**Which `S` to report at.** The convention is not a constant, it is a rule:
+
+> `S` is the first value at which *every* arm free to choose one has
+> converged.
+
+For the four arms here that is **64** — mean-field is flat by 32, but Vadam and
+low-rank are still climbing there and only flatten at 64, so 32 would state
+those two below their own converged values. So:
+
+- If your arm converges *later* than 64, **raise the suite's `S`** and re-run
+  the other arms at the new value. Reporting your arm at its own `S` and the
+  rest at 64 compares estimators at different amounts of bias.
+- If your arm converges at 8, **you still report at 64**, because the others do
+  not. The rule is the slowest arm's requirement, never the fastest's.
+- The deep ensemble is the one arm the rule cannot reach: its `s`-th sample is
+  its `s`-th trained member, so its `S` is `E = 5` and a further draw costs a
+  training run. An arm whose `S` is structurally pinned states it and is
+  compared knowing that.
+
+Where your arm converges is measured, not asserted. Sweep it — one eval per
+`S`, seconds each — into `runs/sweep/<arm>_S<N>_val.log`:
+
+```
+for S in 1 2 4 8 16 32 64 128; do
+  ./train_<yourarm> eval 100000 $S 64 val > runs/sweep/<yourarm>_S${S}_val.log
+done
+```
+
+`make_figures.py` reads those logs, marks the suite's `S` on the convergence
+figure and prints it (`make_figures: suite S 64`). It derives it rather than
+taking it on faith: an arm counts as converged at the smallest `S` from which
+it and every larger `S` agree to within the one printed digit the harness
+resolves, and if some arm is still climbing at the end of the range it leaves
+the figure unmarked instead of settling the question on the arms that did
+converge. Sweep further out if that happens.
+
 Time it:
 
 ```

@@ -259,8 +259,19 @@ bullet lists, and the count that budget refers to is
 
     cd paper && cat main.tex sections/*.tex | grep -v '^\s*%' | wc -w
 
-The two open decisions it deliberately does not settle are which split to
-standardise on and whether S moves to 64.
+The one open decision it deliberately does not settle is which split to
+standardise on.
+
+**The evaluation S is a rule, not a constant.** S is the first value at which
+every arm free to choose one has converged, which for these four is 64: BBB is
+flat by 32, Vadam and LowR are not. State the rule wherever the number would be
+tempting — `paper/sections/suite.tex` and `docs/adding-an-arm.md` both carry it,
+because an arm added later may converge later and must raise S rather than
+inherit 64. `make_figures.py` derives it from `runs/sweep/*.log` instead of
+taking it (`converged_S`, agreement to within the one printed digit
+`uq_report` resolves, confirmed by a further doubling) and marks it on the
+convergence figure; it leaves the figure unmarked if any sweepable arm is still
+climbing at the end of the range.
 
 The prose cites for real and `\nocite{*}` is gone, so an entry in
 `references.bib` that loses its last citation silently vanishes from the
