@@ -50,6 +50,17 @@ refactor.
   checkpoint was trained at; `ckpt_load`'s element-count check catches mismatch.
 - `scorecard.c` parses stdout by format string (`step %d | nll %f | ...` and
   `summary:` lines, first 3 only). Changing those formats breaks the scorecard.
+- `paper/tables/make_tables.py` parses the SAME two formats plus the `eval:`
+  header line, so a format change breaks the paper's tables too. It has a
+  `--selftest` that pins them.
+
+## The paper
+
+`paper/` — see `paper/README.md` for build, table regeneration, and the
+venue-template swap. One rule holds everywhere: **no number is ever typed
+into the paper.** Cost and quality tables are generated from `runs/` into
+`paper/tables/generated/` (gitignored) and a cell with no measurement
+behind it renders as a loud red `TODO`, never as a plausible value.
 
 ## Maintaining this file
 

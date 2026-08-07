@@ -1,0 +1,33 @@
+\section{Four posteriors over one network}
+\label{sec:methods}
+
+% The framing that makes the comparison controlled: state once, here, what
+% is held fixed (architecture, data, forward and backward pass, kernels,
+% RNG discipline) so each subsection below only has to say how weights are
+% sampled and how they are updated.
+\todo{shared setup: what is identical across all four arms}
+
+\subsection{Bayes-by-Backprop}
+\label{sec:m:bbb}
+% Mean-field Gaussian posterior, reparameterised sample per step, ELBO with
+% the KL weight fixed by the data (1/N), not tuned.
+\todo{BBB}
+
+\subsection{Vadam}
+\label{sec:m:vadam}
+% Variational online Newton read as a perturbation of Adam: the second
+% moment doubles as the posterior precision, so the posterior is (almost)
+% free. Note where N enters the scale.
+\todo{Vadam}
+
+\subsection{Low-rank plus diagonal covariance}
+\label{sec:m:lowrank}
+% Posterior covariance as a rank-r factor plus a diagonal: what the extra
+% rank is meant to buy, and what it costs in memory and per-step time.
+\todo{low-rank + diagonal}
+
+\subsection{Deep ensemble (control)}
+\label{sec:m:ensemble}
+% The control arm: no posterior machinery at all, E independently trained
+% members. Say why it is the reference the other three are measured against.
+\todo{deep ensemble}
