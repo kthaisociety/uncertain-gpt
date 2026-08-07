@@ -1,25 +1,24 @@
 \section{Introduction}
 \label{sec:intro}
 
-% What this paper measures: the GPU cost of a posterior on a transformer,
-% and what quality that cost buys. State the controlled-comparison design
-% here — one network, one dataset, one forward/backward pass, only the
-% posterior varies. No results in this section. No claims about the field:
-% this paper may state what it measured and what a cited work says.
+% The mechanism claim, then the implementation that makes it measurable. No
+% results in this section. No claims about the field: this paper may state what
+% it measured and what a cited work says.
 
-A posterior over the weights of a transformer is paid for in GPU memory and
-GPU time. This paper prices four of them against each other on one network,
-one corpus and one card.
+A step of Bayesian training on a GPU costs what its optimiser moves. Every
+parameter-sized kernel here runs at the card's memory bandwidth, so a posterior's
+per-step price reduces to two counts: how many parameter-sized buffers the method keeps,
+and how many times a step reads or writes each. Neither count contains the batch
+size.
 
-Bayes-by-Backprop \citep{blundell2015weight}, Vadam \citep{khan2018vadam}, a
-learned low-rank-plus-diagonal Gaussian posterior, and a deep ensemble
-\citep{lakshminarayanan2017simple} share a single CUDA implementation of GPT-2
-\citep{radford2019language}: the same kernels, the same forward and backward
-pass, the same batches in the same order, the same AdamW hyperparameters, the
-same precision. Each method's source file contains only how it draws a weight
-vector and how it updates the parameters behind that draw, and everything else
-lives in one shared header. Any difference between two arms is the posterior.
-
-In CUDA a posterior is a count of parameter-sized buffers and a count of kernel
-passes over them, and cost is reported in those units and in milliseconds per
-step. Quality comes from one harness shared by all four arms.
+Four optimisation strategies are implemented over one network to make those counts
+measurable. Bayes-by-Backprop \citep{blundell2015weight}, Vadam
+\citep{khan2018vadam}, a learned low-rank-plus-diagonal Gaussian covariance and a
+five-member deep ensemble \citep{lakshminarayanan2017simple} share a single CUDA
+implementation of a GPT-2 \citep{radford2019language}: the same kernels, the same
+forward and backward pass, the same batches in the same order, the same AdamW
+hyperparameters, the same precision. Each arm's source file holds only what it stores
+and how it updates it, and the ensemble stores no posterior, so every buffer the other
+three add is attributable to their optimiser. Every region of every step is bracketed
+by CUDA events at the launch sites, so each arm's Bayesian work is timed rather than
+inferred as a difference against a baseline that also differs elsewhere.

@@ -1,72 +1,60 @@
-\section{Experimental setup}
+\section{Setup and measurement protocol}
 \label{sec:setup}
 
-% Model, data, hardware, and the measurement protocol.
-%
-% - Architecture and parameter count; the transformer stack follows
-%   \citet{vaswani2017attention} and the GPT-2 configuration
-%   \citep{radford2019language}; attention is the IO-aware formulation of
-%   \citet{dao2022flashattention}; the deterministic scaffolding follows
-%   llm.c \citep{karpathy2024llmc} and nanoGPT \citep{karpathy2022nanogpt}.
-% - Dataset and splits \citep{mahoney2011text8}; optimiser
-%   \citep{kingma2015adam,loshchilov2019adamw}; RNG
-%   \citep{salmon2011parallel}.
-% - How cost is measured (which steps count, what VRAM figure means) and
-%   how quality is measured: NLPD, ECE \citep{guo2017calibration}, and the
-%   aleatoric/epistemic decomposition \citep{kendall2017uncertainties},
-%   including the exact-identity check the harness enforces.
-%
-% Every configuration number stated here must be traceable to the repo.
+% Model, data, hardware, and what a region time is: the headline claim is a
+% per-region time, so the protocol has to be stated. Every configuration number
+% must be traceable to the repo.
 
-\paragraph{Model.}
-A GPT-2 \citep{radford2019language} of the usual pre-LayerNorm transformer
-shape \citep{vaswani2017attention}: width $C = 384$, $6$ heads, $6$ blocks,
-vocabulary $V = 27$, maximum context $1024$, trained at sequence length
-$T = 64$ and batch $B = 4$. That is $11{,}061{,}531$ parameters, of which the
-six transformer blocks hold about $96\%$. Attention uses the IO-aware
-formulation of \citet{dao2022flashattention}, so no $(B, \mathrm{NH}, T, T)$
-score buffer is allocated. Data format, loader and reference implementation
-follow llm.c \citep{karpathy2024llmc} and nanoGPT \citep{karpathy2022nanogpt}.
+\paragraph{Model, data, hardware.}
+A GPT-2 \citep{radford2019language} of the usual pre-LayerNorm shape
+\citep{vaswani2017attention} at $C = 384$, $6$ heads, $6$ blocks, $V = 27$, trained at
+$T = 64$ and $B = 4$: $11{,}061{,}531$ parameters, the six blocks holding about $96\%$.
+Attention is the IO-aware formulation of \citet{dao2022flashattention}; format, loader
+and reference implementation follow llm.c \citep{karpathy2024llmc} and nanoGPT
+\citep{karpathy2022nanogpt}. The corpus is text8 \citep{mahoney2011text8},
+character-level over $27$ symbols in the standard $90$M/$5$M/$5$M split, walked
+sequentially so every arm sees the same tokens in the same order, for $100{,}000$
+steps. One RTX 2060 Max-Q, \texttt{sm\_75}, $6$\,GB, fp32 throughout, the four GEMMs
+per block through cuBLAS and every other kernel checked against a single-threaded C
+reference. AdamW \citep{kingma2015adam,loshchilov2019adamw} everywhere at learning rate
+$10^{-4}$, $\beta = (0.9, 0.999)$, $\epsilon = 10^{-8}$, no weight decay, no schedule,
+and Philox 4x32-10 \citep{salmon2011parallel} for randomness, so a perturbation is a
+pure function of (seed, step, weight index) and is regenerated in the backward pass
+rather than stored.
 
-\paragraph{Data.}
-text8 \citep{mahoney2011text8}, character-level over $27$ symbols (lowercase
-\texttt{a}--\texttt{z} plus space), in the standard split: the first $90$M
-tokens for training, the next $5$M for validation, the last $5$M for test. The
-loader walks the corpus sequentially and hands out $B \cdot T = 256$ contiguous
-tokens per step, so every arm sees the same tokens in the same order. Each arm
-trained for $100{,}000$ steps, or $25.6$M tokens.
+\paragraph{Timing a region.}
+Step times come from the real training step with CUDA event marks at region
+boundaries, one region per kernel group, rather than from a copy of it that can drift,
+and a region's name records whether its cost is $O(P)$ and Bayesian, $O(P)$ and paid by
+a deterministic trainer too, or $O(B \cdot T)$. Warm-up is discarded, $30$ steps at $B
+\leq 8$ falling to $10$ at $B = 256$, and the statistic is a median over the $40$ to
+$270$ retained steps with $p25$ and $p75$ beside it, so a throttled bimodal sample
+stays visible instead of smearing into a mean. Temperature and SM clock are probed
+every $20$ steps and printed with each measurement, the binary aborts above
+$89$\,\textdegree C, and the driver idles between points until the card is under
+$72$\,\textdegree C. A point with less than $384$\,MB of VRAM headroom is reported out
+of range rather than measured (Section~\ref{sec:limitations}). The sweep runs $B = 1$
+to $256$ at $T = 64$ held. Touch counts are cross-checked rather than trusted:
+converting a region's time to achieved bandwidth (Table~\ref{tab:bandwidth}) has to put
+structurally unrelated regions in one band, and a wrong count lands off it.
 
-\paragraph{Hardware and precision.}
-One RTX 2060 Max-Q, compute capability \texttt{sm\_75}, $6$\,GB of VRAM, fp32
-throughout. The four GEMMs per block go through cuBLAS; every other kernel is
-hand-written, benchmarked in \texttt{dev/} and checked against the
-single-threaded C reference.
-
-\paragraph{Optimiser and RNG.}
-AdamW \citep{kingma2015adam,loshchilov2019adamw} in every arm with the same
-constants: learning rate $10^{-4}$, $\beta = (0.9, 0.999)$,
-$\epsilon = 10^{-8}$, weight decay $0$, no schedule. Randomness comes from
-Philox 4x32-10 \citep{salmon2011parallel}, so a perturbation is a pure function
-of (seed, step, weight index). The backward pass regenerates the forward pass's
-$\varepsilon$ from the index and no arm stores a perturbation buffer.
-Evaluation draws come from a seed disjoint from every training stream.
-
-\paragraph{Measuring cost.}
-Step time is wall time around the complete step, taken with CUDA events on the
-device that ran it, and covers the host-to-device copy, buffer clears, weight
-sampling, forward, backward and parameter update. VRAM is the sum of an arm's
-allocations, computed from the buffer layout rather than read from a driver
-tool, and excludes allocator slack and context overhead.
+\begin{table}[t]
+  \centering
+  \small
+  \input{\generated/tab-bandwidth}
+  \caption{Every parameter-sized region of the mean-field step, touches counted at the
+  launch sites and converted at $P \cdot 4$ bytes each. The aggregate row is the sum of
+  the rows above it; \texttt{*fused\_step} is the same work after folding.}
+  \label{tab:bandwidth}
+\end{table}
 
 \paragraph{Measuring quality.}
-Evaluation loads a checkpoint and never trains. Each arm supplies only a
-callback returning draw $s$, and the shared harness does the rest. Per
-position, over $S$ draws with predictive distributions $p_s$ and mixture
-$\bar{p} = \frac{1}{S}\sum_s p_s$, it reports negative log predictive density
-of the mixture and of a single draw, expected calibration error over $15$ bins
-of next-token argmax confidence \citep{guo2017calibration}, and the
-decomposition \citep{kendall2017uncertainties}
-
+Evaluation loads a checkpoint and never trains, and each arm supplies only a callback
+returning draw $s$. Over $S$ draws per position, with predictive distributions $p_s$
+and mixture $\bar{p} = \frac{1}{S}\sum_s p_s$, the shared harness reports negative log
+predictive density of mixture and single draw, expected calibration error over $15$
+bins of argmax confidence \citep{guo2017calibration}, and the decomposition
+\citep{kendall2017uncertainties}
 \begin{equation}
   \underbrace{H[\bar{p}]}_{\text{total}}
   \;=\;
@@ -75,20 +63,7 @@ decomposition \citep{kendall2017uncertainties}
   \underbrace{\tfrac{1}{S}\textstyle\sum_s \mathrm{KL}(p_s \,\|\, \bar{p})}_{\text{epistemic}} ,
   \label{eq:decomp}
 \end{equation}
-
-in nats, accumulated in double precision. Samples are mixed as probabilities,
-never as logits: a logit average is a geometric mean and carries the wrong
-uncertainty.
-
-Equation~\ref{eq:decomp} is an identity for any $S \geq 1$ and any sampler, and
-both halves of the right-hand side are computed directly rather than one from
-the other, so asserting it tests the accumulation and not the posterior. It is
-also normalisation-free: an injected unnormalised row and an injected stale
-sample buffer both held it to $10^{-15}$. The harness asserts it at $10^{-5}$
-for every arm and exits nonzero.
-
-\paragraph{Splits and the off-distribution stream.}
-Every reported number carries its split and its $S$. The off-distribution
-stream is uniform-random token ids from a fixed seed, evaluated over the same
-number of positions as the in-distribution stream. Epistemic uncertainty has to
-rise on it, and the harness warns when it does not.
+in nats, in double precision, mixing samples as probabilities and never as logits.
+Both halves of the right-hand side are computed directly rather than one from the other,
+so the identity, asserted at $10^{-5}$, tests the accumulation and not the posterior.
+The off-distribution stream is uniform-random token ids from a fixed seed.

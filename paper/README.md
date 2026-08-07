@@ -1,8 +1,9 @@
 # paper/
 
-LaTeX scaffolding for the uncertain-gpt paper. **Scaffolding only** — every
-section file holds guiding comments and no prose, and every number reaches
-the PDF through `tables/`, never by hand.
+The uncertain-gpt paper: what a Bayesian posterior costs per training step,
+why, and how much of that cost is removable. Each section file opens with the
+guiding comment for its own scope, and **every number reaches the PDF through
+`tables/`, never by hand.**
 
 ## Build
 
@@ -35,13 +36,34 @@ python3 paper/tables/make_tables.py --selftest   # parser self-check
 
 `make_tables.py` reads
 
-- `runs/results.csv` — appended per run by `scorecard.c`; cost columns.
+- `runs/results.csv` — appended per run by `scorecard.c`; the training-run
+  record.
 - `runs/*.log` — trainer/eval stdout; the uncertainty columns come from the
   two `summary:` lines `uq_report()` prints in `gpt2_kernels.cuh`, and the
   `eval:` line above them supplies the split and *S*.
+- `runs/bench_{pre,post}.log` — the `bench:` and `bench-region:` lines of the
+  batch sweep, before and after the parameter update was fused. The variant
+  tag is the filename, so the two must not be merged by recency.
 
-and writes `tables/generated/tab-{cost,quality,uncertainty,ood}.tex`, which
-the results sections `\input`. Those files are **committed**; see below.
+and writes `tables/generated/tab-{cost,quality,uncertainty,ood,posterior,
+bandwidth,amortization,fusion}.tex`, which the sections `\input`. Those files
+are **committed**; see below.
+
+The four cost tables carry the paper's headline. `tab-posterior` is the
+directly timed Bayesian work per arm over the sweep and is stated for the
+**unfused** variant, because after fusing the Bayesian update shares a kernel
+with the deterministic one and only total *O(P)* work is separable; that is
+why `tab-amortization` and `tab-fusion` report *O(P)* rather than a
+Bayesian-only column. `tab-bandwidth` converts a region's measured time to
+achieved bandwidth using touch counts read off the launch sites, which is the
+one place in the generator where a number comes from source rather than from a
+log — and the check on it is the table itself, since a wrong count puts its
+region off the band the others sit in.
+
+`tab-cost.tex` is still generated but **no longer `\input` by the paper**: its
+`ms/step` column is a whole-run average from before the timing protocol
+existed, and footprint is not a claim the current draft makes. It stays
+generated because it is the record of which runs the checkpoints came from.
 
 The quality and uncertainty tables carry **one row per (arm, split)** and
 prefer neither split — which split the paper standardises on is still open,
@@ -155,3 +177,8 @@ tables/make_tables.py the only thing allowed to put a number in the PDF
 tables/generated/     its output: the .tex fragments and the figure PDF are
                       committed and stamped, everything else there is not
 ```
+
+The three widest cost tables are wrapped in `\resizebox{\linewidth}` where the
+section `\input`s them; without it they run up to 140pt into the margin. A
+generated fragment is a bare `tabular` precisely so the float, not the
+generator, decides that.

@@ -85,8 +85,11 @@ the first character of the name: `*` = O(P) and Bayesian, `+` = O(P) but a
 deterministic trainer pays it too, unprefixed = O(B·T). Warm-up is discarded,
 the statistic is a median with p25/p75, and every `bench:` line carries the
 temperature and SM-clock range it was taken at. `make_tables.py` parses
-`bench:` into `tab-amortization.tex` / `tab-fusion.tex`, so that format is
-pinned like the `step`/`summary:` ones.
+`bench:` and `bench-region:` into `tab-{posterior,bandwidth,amortization,
+fusion}.tex`, so those formats are pinned like the `step`/`summary:` ones. The
+region lines carry the paper's leading claim, and `tab-bandwidth` converts them
+with touch counts read off the launch sites (`TOUCHES` in the generator) — the
+one number there that comes from source rather than a log.
 
 Three traps this hit, all of which produce plausible wrong numbers:
 
@@ -205,9 +208,19 @@ them.
 ## The paper
 
 `paper/` — see `paper/README.md` for build, table regeneration, and the
-venue-template swap. One rule holds everywhere: **no number is ever typed
-into the paper.** Cost and quality tables are generated from `runs/` into
-`paper/tables/generated/` and a cell with no measurement behind it renders
+venue-template swap.
+
+**The paper is a systems paper about optimisation cost, not a comparison of
+posteriors.** Its thesis is that a Bayesian posterior's training cost is memory
+traffic over parameter-sized buffers: fixed per step, therefore amortising with
+batch size, and removable in proportion to the redundant traffic. The four arms
+are four optimisation strategies with different cost structures, and the quality
+numbers are kept but demoted to "what did the cost buy". A draft that ranks
+posteriors has lost the thesis; that framing was rejected once already.
+
+One rule holds everywhere: **no number is ever typed into the paper.** Cost and
+quality tables are generated from `runs/` into `paper/tables/generated/`, and a
+cell with no measurement behind it renders
 as a loud red `TODO`, never as a plausible value. Those generated `.tex`
 fragments and the figure PDF **are committed**, because CI (and any clone)
 has no `runs/` and would otherwise publish a PDF of nothing but `TODO`: a
@@ -217,13 +230,22 @@ one is detectable. Change a number by regenerating with `runs/` present —
 never by editing a fragment. `paper/main.pdf` is tracked and rebuilt by
 `.github/workflows/paper.yml` so GitHub can render it.
 
-Two presentation choices there are load-bearing, not cosmetic; `paper/README.md`
-says why. The quality and uncertainty tables carry **one row per (arm, split)
-and prefer neither** — which split the paper standardises on is an open
-decision, and a table that picks would settle it silently. And `tab-ood.tex`
+Three presentation choices there are load-bearing, not cosmetic;
+`paper/README.md` says why. The quality and uncertainty tables carry **one row
+per (arm, split) and prefer neither** — which split the paper standardises on is
+an open decision, and a table that picks would settle it silently. `tab-ood.tex`
 is a separate table because the OOD stream is a fixed synthetic sequence with
-**no split dependence**; stating it per split implies one. The generator
-refuses to state it once if the two splits ever disagree.
+**no split dependence**; stating it per split implies one, and the generator
+refuses to state it once if the two splits ever disagree. And the flat posterior
+cost (`tab-posterior`) is stated for the **unfused** variant, because fusing puts
+the Bayesian update in the same kernel as the deterministic one and only total
+O(P) work stays comparable across the two. `tab-cost.tex` is still generated as
+the training-run record but is no longer `\input`: its `ms/step` predates the
+`bench_*` protocol that supersedes it.
+
+The prose is held near 3,000 words, with no em-dashes, no first person and no
+bullet lists. The two open decisions it deliberately does not settle are which
+split to standardise on and whether S moves to 64.
 
 The prose cites for real and `\nocite{*}` is gone, so an entry in
 `references.bib` that loses its last citation silently vanishes from the

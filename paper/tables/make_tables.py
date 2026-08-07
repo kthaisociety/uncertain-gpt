@@ -14,13 +14,17 @@ Inputs (both optional; whatever is missing becomes a placeholder):
                      gpt2_kernels.cuh, optionally preceded by the "eval:"
                      line uq_evaluate() prints.
 
-Outputs: paper/tables/generated/tab-{cost,quality,uncertainty,ood}.tex, each
-a bare `tabular` the document wraps in a float. Those files are COMMITTED --
-they are measurements, and CI has no runs/ to remake them from -- so a run
-with nothing measured behind it leaves them alone instead of overwriting a
-real number with a placeholder. Each carries a `% generated:` stamp saying
-which commit and day its numbers came from; that is how a stale one is
-spotted. See paper/README.md.
+Outputs: paper/tables/generated/tab-{cost,quality,uncertainty,ood,posterior,
+bandwidth,amortization,fusion}.tex, each a bare `tabular` the document wraps in
+a float. The last four are the cost tables and come from the `bench:` and
+`bench-region:` lines; tab-cost is the training-run record from results.csv and
+is generated but not currently displayed.
+
+Those files are COMMITTED -- they are measurements, and CI has no runs/ to
+remake them from -- so a run with nothing measured behind it leaves them alone
+instead of overwriting a real number with a placeholder. Each carries a
+`% generated:` stamp saying which commit and day its numbers came from; that is
+how a stale one is spotted. See paper/README.md.
 
 Splits: the quality and uncertainty tables carry one row per (arm, split),
 never a preferred one. The off-distribution epistemic is NOT one of those
@@ -35,6 +39,7 @@ and this script never computes a stand-in.
 import argparse
 import csv
 import datetime
+import math
 import os
 import re
 import subprocess
@@ -204,6 +209,31 @@ RE_BENCH = re.compile(
 
 BENCH_TAG = re.compile(r"^bench_(\w+)\.log$")
 
+# One line per (arm, B, region), same files:
+#   bench-region: arm %s | B %d | %-14s | %f ms
+RE_REGION = re.compile(
+    r"^bench-region:\s+arm\s+(\S+)\s+\|\s+B\s+(\d+)\s+\|\s+(\S+)\s+\|\s+(\S+)\s+ms")
+
+# Parameter-sized buffer TOUCHES (reads + writes of a P-element buffer) per
+# region, counted at the launch sites in the arm's .cu file. Structure, not
+# measurement: this is the only thing in this file that is read off source
+# rather than off a log, and it is here so the table can convert a measured
+# time into an achieved bandwidth. The check that it is right is the table
+# itself -- a wrong count puts its region off the band the others sit in.
+TOUCHES = {
+    ("pre", "bbb"): {"*sample": 3, "+zero_dw": 1, "*zero_post": 2,
+                     "*post_bwd": 6, "*kl": 6, "+adamw_mu": 7,
+                     "*adamw_rho": 7},
+    ("post", "bbb"): {"*fused_step": 15},
+}
+
+# Bytes per element in every parameter-sized buffer: fp32 throughout.
+BYTES_PER_ELEM = 4
+
+# The arms that draw a weight vector. The control has no posterior region, so
+# it has no row in the tables that price one.
+BAYES_ARMS = ["BBB", "Vadam", "LowR"]
+
 
 def read_bench_records(paths):
     """One record per (variant, arm, B). Later lines win within a file, so a
@@ -234,6 +264,27 @@ def read_bench_records(paths):
                     "temp_lo": int(g[14]), "temp_hi": int(g[15]),
                     "sm_lo": int(g[16]), "sm_hi": int(g[17]),
                 }
+    return out
+
+
+def read_region_records(paths):
+    """Milliseconds per (variant, arm, B, region). Same files as the bench
+    records; a re-run of one point simply overwrites it."""
+    out = {}
+    for path in paths:
+        m = BENCH_TAG.match(os.path.basename(path))
+        if not m:
+            continue
+        try:
+            fh = open(path, errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                r = RE_REGION.match(line)
+                if r:
+                    out[(m.group(1), r.group(1), int(r.group(2)),
+                         r.group(3))] = num(r.group(4))
     return out
 
 
@@ -427,6 +478,100 @@ def ood_table(records, srcs):
                   "lrrrr", body, "source: %s" % srcs), disagreed)
 
 
+def local_exponent(lo, hi):
+    """k in share = B^-k between two adjacent measured points."""
+    if not (lo and hi) or lo["share"] <= 0 or hi["share"] <= 0:
+        return None
+    return (math.log(lo["share"] / hi["share"])
+            / math.log(float(hi["B"]) / float(lo["B"])))
+
+
+def posterior_table(bench, tag, srcs):
+    """The Bayesian work's own cost, per arm, over the whole batch sweep.
+
+    The posterior column is DIRECTLY timed: before fusion each arm's Bayesian
+    work sits in its own kernel launches, every launch is bracketed by CUDA
+    events, and nothing here is a difference against a deterministic baseline
+    that also differs elsewhere. That isolation is what fusion gives up, so
+    this table is stated for the unfused variant and the fused one is priced
+    in total O(P) work instead (see fusion_table).
+
+    One row per arm rather than one per B: the low-rank arm's largest point is
+    refused by the VRAM guard, and a per-B table would have to render that
+    refusal as an unmeasured cell. Each arm's range is therefore its own, and
+    the spread is over the points it reached."""
+    body = []
+    for key in BAYES_ARMS:
+        rs = sorted((r for k, r in bench.items() if k[0] == tag and k[1] == key),
+                    key=lambda r: r["B"])
+        if not rs:
+            body.append([key] + [NA] * 8)
+            continue
+        ms = [r["posterior"] for r in rs]
+        lo, hi = min(ms), max(ms)
+        body.append([
+            tex_escape(canon(rs[0]["arm"])[1]),
+            "%d--%d" % (rs[0]["B"], rs[-1]["B"]),
+            fmt(lo, 3), fmt(hi, 3),
+            fmt(100.0 * (hi / lo - 1.0), 1) + r"\%",
+            fmt(100.0 * rs[0]["share"], 2) + r"\%",
+            fmt(100.0 * rs[-1]["share"], 2) + r"\%",
+            fmt(local_exponent(rs[0], rs[1]) if len(rs) > 1 else None, 3),
+            fmt(local_exponent(rs[-2], rs[-1]) if len(rs) > 1 else None, 3),
+        ])
+    return table(
+        ["Arm", "$B$ range", "Posterior ms (min)", "(max)", "Spread",
+         "Share at $B=1$", "Share at max $B$", "$k$ (small end)",
+         "$k$ (top end)"],
+        "llrrrrrrr", body,
+        "source: %s (variant %s)" % (srcs, tag))
+
+
+def bandwidth_table(regions, bench, tag_before, tag_after, srcs, arm="bbb"):
+    """Time per region converted to achieved bandwidth, which is what makes
+    the touch counts a measurement rather than a claim: structurally unrelated
+    regions have to land in one band, and the aggregate has to land on the
+    card's own ceiling. A region off the band means its count is wrong.
+
+    Two batch sizes, 32x apart, because a parameter-sized region cannot
+    depend on B and this is where that is visible per region rather than per
+    step."""
+    B_lo, B_hi = 4, 128
+    P = next((r["params"] for k, r in bench.items() if k[1] == canon(arm)[0]),
+             None)
+
+    def row(tag, region, touches, label=None):
+        t_lo = regions.get((tag, arm, B_lo, region))
+        t_hi = regions.get((tag, arm, B_hi, region))
+        gb = lambda ms: (None if not (ms and P) else
+                         touches * P * BYTES_PER_ELEM / (ms * 1e-3) / 1e9)
+        return [r"\texttt{%s}" % tex_escape(label or region), str(touches),
+                fmt(t_lo, 4), fmt(gb(t_lo), 1), fmt(t_hi, 4), fmt(gb(t_hi), 1)]
+
+    def total(tag, regs):
+        got = [[regions.get((tag, arm, B, r)) for r in regs] for B in (B_lo, B_hi)]
+        sums = [None if any(v is None for v in g) else sum(g) for g in got]
+        n = sum(regs.values())
+        gb = lambda ms: None if not (ms and P) else \
+            n * P * BYTES_PER_ELEM / (ms * 1e-3) / 1e9
+        return ["all $O(P)$ work", str(n),
+                fmt(sums[0], 4), fmt(gb(sums[0]), 1),
+                fmt(sums[1], 4), fmt(gb(sums[1]), 1)]
+
+    pre = TOUCHES.get((tag_before, arm), {})
+    post = TOUCHES.get((tag_after, arm), {})
+    body = [row(tag_before, r, n) for r, n in pre.items()]
+    if pre:
+        body.append(total(tag_before, pre))
+    body += [row(tag_after, r, n) for r, n in post.items()]
+    return table(
+        ["Region", "Touches", "ms at $B=%d$" % B_lo, "GB/s",
+         "ms at $B=%d$" % B_hi, "GB/s"],
+        "lrrrrr", body,
+        "source: %s (arm %s, %s then %s)"
+        % (srcs, arm, tag_before, tag_after))
+
+
 def amortization_table(bench, tag, srcs):
     """The measured curve: what fraction of a step the posterior owns, as B
     grows with T held. One row per batch size, one column pair per arm.
@@ -471,7 +616,11 @@ def fusion_table(bench, before, after, srcs):
     amortization_table.
 
     A row exists only where BOTH variants measured that (arm, B) -- a speedup
-    against a point that was never measured is not a measurement."""
+    against a point that was never measured is not a measurement.
+
+    The last column is the share after over the share before, at that B. It
+    answers a different question from the ratio of times: whether fusing moved
+    the amortization curve down or bent it."""
     keys = sorted({(k[1], k[2]) for k in bench if k[0] in (before, after)},
                   key=lambda ab: (ARM_ORDER.get(ab[0], len(ARM_ORDER)), ab[1]))
     body = []
@@ -486,12 +635,14 @@ def fusion_table(bench, before, after, srcs):
             fmt(pre["total"], 2), fmt(post["total"], 2),
             fmt(100.0 * pre["paramwork"] / pre["total"], 1),
             fmt(100.0 * post["paramwork"] / post["total"], 1),
+            fmt(ratio(post["paramwork"] / post["total"],
+                      pre["paramwork"] / pre["total"]), 2),
         ])
     return table(
         ["Arm", "$B$", "$O(P)$ ms before", "$O(P)$ ms after", "$\\times$",
          "ms/step before", "ms/step after", "$O(P)$ \\% before",
-         "$O(P)$ \\% after"],
-        "lrrrrrrrr", body,
+         "$O(P)$ \\% after", "share ratio"],
+        "lrrrrrrrrr", body,
         "source: %s (%s vs %s)" % (srcs, before, after))
 
 
@@ -518,6 +669,7 @@ def main():
     csv_rows = read_csv_rows(csv_path)
     records = read_eval_records(log_paths)
     bench = read_bench_records(log_paths)
+    regions = read_region_records(log_paths)
     srcs = ("%d log file(s) under %s" % (len(log_paths), rel(args.logs))
             if log_paths else "(no logs found)")
 
@@ -528,6 +680,9 @@ def main():
         "tab-quality.tex": quality_table(records, srcs),
         "tab-uncertainty.tex": uncertainty_table(records, srcs),
         "tab-ood.tex": ood,
+        "tab-posterior.tex": posterior_table(bench, args.bench_before, srcs),
+        "tab-bandwidth.tex": bandwidth_table(regions, bench, args.bench_before,
+                                             args.bench_after, srcs),
         "tab-amortization.tex": amortization_table(bench, args.bench_after, srcs),
         "tab-fusion.tex": fusion_table(bench, args.bench_before,
                                        args.bench_after, srcs),
@@ -611,6 +766,42 @@ def selftest():
     split_dep = only_val + [rec("bbb", "test", epi=0.0103, epi_ood=0.0130)]
     ood2, bad2 = ood_table(split_dep, "none")
     assert bad2 == ["BBB"] and "0.0119" not in ood2 and "0.0130" not in ood2, ood2
+
+    # ---- the bench tables -------------------------------------------------
+    # A synthetic sweep where the posterior is FIXED and the step doubles, so
+    # the share must halve and the local exponent must come out at exactly 1.
+    def brec(tag, arm, B, post, paramwork, total):
+        return {"tag": tag, "arm": arm, "B": B, "T": 64, "tokens": 64 * B,
+                "params": 1000000, "steps": 10, "warmup": 1, "total": total,
+                "posterior": post, "paramwork": paramwork,
+                "model": total - paramwork, "share": post / total,
+                "p25": 0.0, "p75": 0.0, "temp_lo": 60, "temp_hi": 70,
+                "sm_lo": 1, "sm_hi": 2}
+    sweep = {}
+    for B, total in ((1, 10.0), (2, 20.0)):
+        sweep[("pre", "BBB", B)] = brec("pre", "bbb", B, 1.0, 2.0, total)
+        sweep[("post", "BBB", B)] = brec("post", "bbb", B, 1.0, 1.0, total)
+    assert abs(local_exponent(sweep[("pre", "BBB", 1)],
+                             sweep[("pre", "BBB", 2)]) - 1.0) < 1e-12
+    pt = posterior_table(sweep, "pre", "none")
+    assert "1.000 & 1.000 & 0.0\\%" in pt, pt        # fixed cost, no spread
+    assert "10.00\\% & 5.00\\%" in pt, pt            # share halves
+    assert "1.000 & 1.000" in pt, pt                 # k = 1 at both ends
+    assert pt.count(NA) == 2 * 8, pt                 # the two unmeasured arms
+    # the fusion table's share ratio is post-share over pre-share
+    ft = fusion_table(sweep, "pre", "post", "none")
+    assert "20.0 & 10.0 & 0.50" in ft and "10.0 & 5.0 & 0.50" in ft, ft
+    # bandwidth: touches x P x 4 bytes over the measured time, and a region
+    # with no measurement stays unmeasured rather than becoming a zero.
+    TOUCHES[("pre", "bbb")] = {"r0": 2}
+    TOUCHES[("post", "bbb")] = {"r1": 1}
+    try:
+        regions = {("pre", "bbb", 4, "r0"): 1.0, ("pre", "bbb", 128, "r0"): 2.0}
+        bw = bandwidth_table(regions, sweep, "pre", "post", "none")
+        assert "1.0000 & 8.0 & 2.0000 & 4.0" in bw, bw   # 2*1e6*4B / 1ms
+        assert bw.count(NA) == 4, bw                     # r1 measured nowhere
+    finally:
+        del TOUCHES[("pre", "bbb")], TOUCHES[("post", "bbb")]
 
     # a fragment is committed, so a run with nothing measured must leave it
     # alone -- and a rerun that changes nothing but the stamp must not churn.

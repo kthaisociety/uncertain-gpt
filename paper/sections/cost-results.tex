@@ -1,42 +1,98 @@
 \section{What the posterior costs}
 \label{sec:cost}
 
-% Memory and time, per arm, on one card. Read Table~\ref{tab:cost}; do not
-% restate its numbers in the text, interpret them. Anything a cell does not
-% contain has not been measured yet.
+% Three results, in this order: the posterior's cost is fixed per step, its share
+% therefore falls (with the small-B caveat in the main text, not a footnote), and
+% the part of it that is redundant traffic is removable. Interpret the tables; do
+% not retype them.
 
-The three posteriors price differently by an order of magnitude, and the
-ordering follows the buffer count rather than the arithmetic. Vadam's step
-lands within a millisecond of the ensemble member's: its posterior is optimiser
-state the run had already allocated, so it adds only the sampling kernel of
-Equation~\ref{eq:vadam-sigma}. Mean-field adds a second parameter-sized tensor,
-its AdamW moment pair, and a second update pass. The low-rank arm adds the
-factor $A$, which at $r = 8$ is eight tensors the size of the Bayesian
-parameter block, read, written and sampled from every step.
+\subsection{The cost is fixed per step}
+\label{sec:cost:flat}
 
-The ensemble's row is one member's, and its step is the deterministic step. Its
-bill is $E$ times that step and $E$ times the training run, so the cheapest arm
-per step is the most expensive arm to train, and the only one whose
-evaluation-time $S$ cannot be raised without paying again.
+Each arm's posterior work costs the same milliseconds at $64$ tokens per step as at
+$16{,}384$. Across a $256$-fold batch sweep the directly timed Bayesian regions hold
+to within $1.1\%$ of themselves for mean-field, $1.5\%$ for Vadam and $1.4\%$ for
+the low-rank arm (Table~\ref{tab:posterior}): the width of the measurement, not a
+trend in it.
 
-Vadam fails the one-batch overfit gate, which drives a single batch to
-near-zero loss. Its injected noise does not shrink as the mean fits, so its
-loss floors well above every other arm's while the run itself is healthy.
-Section~\ref{sec:quality} gives the reason.
-
-These are lower bounds, measured on a thermally limited card over two sessions
-(Section~\ref{sec:limitations}). A difference of a few milliseconds between two
-rows is not a result.
+Nothing in those regions has a token in it. They stream parameter-sized buffers, and
+how many tokens produced the gradient in one does not change its length. The traffic
+is what the time is: every parameter-sized region of the mean-field step lands
+between $234.7$ and $253.7$\,GB/s and their aggregate at $240.8$\,GB/s
+(Table~\ref{tab:bandwidth}), so regions sharing no arithmetic differ only in how
+many buffers each walks.
 
 \begin{table}[t]
   \centering
-  \input{\generated/tab-cost}
-  \caption{Cost per arm on one RTX 2060 Max-Q, from \texttt{runs/results.csv}.
-  \texttt{ms/step} is wall time around the complete step and VRAM the sum of
-  the arm's allocations, both as defined in Section~\ref{sec:setup}. The
-  ensemble's row is \emph{one member}; multiply by $E = 5$ for the training
-  bill. \texttt{overfit} is the one-batch memorisation gate, \texttt{train} the
-  $100{,}000$-step run. Step times are lower bounds
-  (Section~\ref{sec:limitations}).}
-  \label{tab:cost}
+  \resizebox{\linewidth}{!}{\input{\generated/tab-posterior}}
+  \caption{Each arm's own Bayesian work, timed at the launch sites, unfused. Share is
+  the posterior over the whole step, $k$ the exponent in $\text{share} \propto B^{-k}$
+  between the two smallest and the two largest points measured.}
+  \label{tab:posterior}
+\end{table}
+
+\subsection{Amortisation, and where it stops}
+\label{sec:cost:amort}
+
+The network's cost grows with tokens and the posterior's does not, so the
+posterior's share of a step falls: mean-field from $34.40\%$ at $B = 1$ to $0.75\%$
+at $B = 256$, at a local exponent of $1.005$ over the last two points, Vadam at
+$0.998$ (Table~\ref{tab:posterior}).
+
+That asymptote is not the whole curve. Between $B = 1$ and $B = 2$ the exponent is
+$0.148$ for mean-field and $0.196$ for Vadam, and the reason is the denominator: the
+network is not $O(B \cdot T)$ at the bottom of the sweep either. The control arm
+shows that with no posterior in the way, costing $8.45$\,ms at $64$ tokens and
+$9.83$\,ms at $128$, a factor of $1.16$ for twice the work, while from $B = 16$
+upward each doubling of tokens doubles the step (Table~\ref{tab:amortization}).
+Below it a forward and backward pass costs more in launches than in tokens, so
+$1/B$ is the asymptote and not the curve.
+
+The fixed numerator is not a property of posteriors either: the control's own
+parameter-sized work falls from $17.7\%$ of its step to $0.5\%$ over the same sweep.
+What fails to amortise is state not proportional to the parameter count, which is why
+the low-rank arm still owns $11.65\%$ of a step at $B = 128$, at an exponent of $0.824$.
+And all of it is per-step cost, so a sweep over $B$ prices neither the ensemble's $E$
+runs nor a variational arm's $S$ passes at evaluation.
+
+\begin{table}[t]
+  \centering
+  \resizebox{\linewidth}{!}{\input{\generated/tab-amortization}}
+  \caption{The batch sweep for the shipped code. $O(P)\%$ is all parameter-sized work
+  over the step, Bayesian or not. The ensemble column is one member, no posterior.}
+  \label{tab:amortization}
+\end{table}
+
+\subsection{The removable part is the redundant traffic}
+\label{sec:cost:fusion}
+
+Folding an arm's parameter-sized passes into one kernel buys time in proportion to the
+traffic it deletes, and nothing where there is none to delete. Mean-field drops $32$
+touches to $15$ and its $O(P)$ time by $1.76\times$ at $B = 1$, falling to $1.65\times$
+at $B = 128$; the low-rank arm drops $122$ units per layer to $58$ and gains $1.14$ to
+$1.16\times$; Vadam drops $11$ to $9$ and lands between $0.98$ and $1.04\times$
+(Table~\ref{tab:fusion}). The control is unchanged code measured in both sweeps and
+comes out within $1\%$ of itself, so anything inside that band is drift, which is where
+Vadam's sits.
+
+That null is what Vadam's pass count predicts. Two touches of slack against a floor
+of $9$ is $1.22\times$ of traffic, and a fused kernel gives back bandwidth:
+mean-field's streams eight buffers at once at $192.9$\,GB/s where the sequence it
+replaced walked three or four each at $240.8$\,GB/s. At that discount a $2.13\times$
+traffic cut is still $1.76\times$ of time and a $1.22\times$ cut is nothing, so a pass
+reduction quoted without a timing would have reported that arm as a $1.22\times$
+improvement.
+
+Folding moves the amortisation curve rather than bending it: mean-field's
+parameter-sized share after folding is $0.68$ of its share before at $B = 1$ and $0.60$
+at $B = 128$. Batching moves an arm along the curve, folding moves the curve down, and
+folding therefore returns most where amortisation has not arrived.
+
+\begin{table}[t]
+  \centering
+  \resizebox{\linewidth}{!}{\input{\generated/tab-fusion}}
+  \caption{Parameter-sized work before and after folding, where both sweeps measured
+  the point; the last column is the share after over the share before. The ensemble's
+  code is identical in both, so its rows are the drift.}
+  \label{tab:fusion}
 \end{table}

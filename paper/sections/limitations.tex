@@ -1,78 +1,43 @@
 \section{Limitations}
 \label{sec:limitations}
 
-% Scope of the claim: one card, one architecture, one corpus, one scale.
-% Which code paths carry a correctness argument and which do not; which
-% comparisons are confounded and what would separate them.
+% The same facts as before, reframed for a mechanism claim: what a cost result at
+% this scale does and does not transfer, what the thermal fault bounds, and which
+% comparisons are confounded.
 
-\paragraph{The scale is small.}
-$11{,}061{,}531$ parameters on a $6$\,GB card, picked so all four arms fit at
-once: a model large enough to fill the card would have priced out the low-rank
-arm and the five-member ensemble. What transfers is the ratio between arms on
-one implementation, not the absolute cost. The character-level vocabulary of
-$27$ keeps the token embedding negligible, so no result here covers a posterior
-over a large embedding table. The position embedding is sized for a
-$1024$-token context while training runs at $64$, so about $3\%$ of the
-parameters never see a data gradient and are held at the prior by the KL term
-alone, while still costing posterior state in three of the four arms.
+\paragraph{The scale bounds the milliseconds, not the counts.}
+$11{,}061{,}531$ parameters on a $6$\,GB card, picked so all four arms fit at once.
+Touch counts do not depend on $P$, and neither does the flat numerator of
+Section~\ref{sec:cost:flat}, but every millisecond and every GB/s here belongs to this
+card. Where the network becomes token-bound does depend on the model: a larger one
+saturates the card at a smaller $B$ and reaches the $1/B$ regime sooner. The vocabulary
+of $27$ keeps the token embedding negligible, so nothing covers a posterior over a
+large embedding table.
 
-\paragraph{Nothing is converged.}
-$100{,}000$ steps at $256$ tokens per step is $25.6$M tokens against a $90$M
-token training split, $28\%$ of one epoch. Every number is what a method does
-at a fixed step budget, and the ranking between arms is free to change with
-more steps.
+\paragraph{The measurement is bounded by the card and by one axis.}
+The card throttles, so the two sweeps are comparable only to about $1\%$: with
+per-point cooldown the later one still started a few degrees warmer and the same region
+comes out a few percent slower for it. That is what the unchanged control arm is for,
+and no claim in Section~\ref{sec:cost:fusion} rests on a difference smaller than the
+drift measured on it. The low-rank arm at $B = 256$ allocated with $248$\,MB of
+$6144$\,MB free and then ran at about four times what its own curve predicts, because
+past a couple of hundred megabytes of headroom the driver backs allocations with host
+memory and the step time stops being a property of the kernels; on WSL2
+\texttt{cudaMalloc} succeeds in that state, so the guard is a headroom floor and that
+arm's sweep ends at $B = 128$. The sweep also varies $B$ at $T = 64$ throughout, so
+what is measured is a dependence on batch size and not on tokens per step. One training
+run per arm, no seed sweep, no error bars, and three backward kernels accumulate with
+\texttt{atomicAdd}, so training is not bit-reproducible in principle; normal-mode runs
+at this configuration do reproduce, which is what the trajectory check of
+Section~\ref{sec:quality} uses, and one-batch overfit runs do not.
 
-\paragraph{Step times are lower bounds, not controlled measurements.}
-The runs span two sessions on a card with a cooling fault. It throttled to
-$46$--$51$\,W at $87$--$89$\,\textdegree C against a board budget of
-$65$--$80$\,W, and the low-rank arm's step time drifted from $52$ to $65$\,ms
-within a single run with no change in the work being done. The two sessions did
-not throttle alike, so the arms were not clocked under matched conditions. A
-gap of a few milliseconds is not a result, and what a healthy card of this
-class would deliver is not measured here.
-
-\paragraph{$n = 1$, and the noise floor is unknown.}
-One training run per arm, no error bars, no seed sweep. The runs are also not
-reproducible in principle: \texttt{encoder\_backward},
-\texttt{layernorm\_backward} and \texttt{attention\_backward} accumulate
-gradients with \texttt{atomicAdd}, so the order of floating-point additions
-varies and two identical invocations diverge. How large that divergence grows
-over $100{,}000$ steps is not measured, so which differences between arms
-exceed it is unknown.
-
-\paragraph{The off-distribution stream is synthetic.}
-Uniform-random token ids, not shifted text. Sample disagreement has to rise
-where the input carries no structure, and an arm that fails that is not
-capturing model uncertainty. It supports no comparison with the shift
-literature \citep{ovadia2019trust}, for which a second text domain would be the
-minimum.
-
-\paragraph{Noise scale and posterior quality are confounded.}
-Loss tracks the injected noise scale monotonically across arms, so an arm that
-samples less aggressively looks better on predictive metrics for a reason
-unrelated to its posterior. Separating the two needs a sweep over the noise
-scale within each arm and a comparison of curves rather than of single points,
-which runs against saved checkpoints.
-
-\paragraph{What each code path's correctness argument covers.}
-Each kernel was validated against the CPU reference implementation, but that
-reference is a single-block model and says nothing about the block loop at
-$L > 1$. That gap is closed by a finite-difference gradient check on a two-block
-configuration, run per parameter group and per block, which agrees to
-$\sim\!10^{-4}$ relative, the same error the single-block configuration shows.
-Vadam's optimiser kernels carry two more checks: a double-precision host
-reference for the update, and a distributional test of the sampler over
-$20{,}000$ draws covering the marginal variances and the absence of
-off-diagonal correlation. Those checks are why Section~\ref{sec:quality}
-attributes that arm's posterior to $N s$ against $\lambda$ rather than to a
-bug. None of this covers the fused FlashAttention kernels beyond the CPU
-reference, and none of it is a proof.
-
-\paragraph{The arms are not identical in what they cover.}
-The low-rank arm places its posterior over the four GEMM weight matrices per
-block and leaves embeddings, LayerNorm parameters and biases deterministic,
-where the other three are Bayesian over every parameter. It covers $96\%$ of
-the model rather than all of it, which flatters its cost. The ensemble
-evaluates at $S = E = 5$ by construction while the Bayesian arms evaluate at
-whatever $S$ is requested, so a mixture metric compared across arms at
-different $S$ compares different sample counts.
+\paragraph{The quality comparison is confounded and unconverged.}
+$100{,}000$ steps at $256$ tokens per step is $28\%$ of one epoch, so every quality
+number is what a method does at a fixed step budget. Loss tracks the injected noise
+scale monotonically across arms, so an arm that samples less aggressively looks better
+on predictive metrics for a reason unrelated to its posterior, and the
+off-distribution stream is uniform-random token ids rather than shifted text, which
+supports no comparison with the shift literature \citep{ovadia2019trust}. The low-rank
+arm is Bayesian over $96\%$ of the model and the ensemble evaluates at $S = E = 5$, so
+a mixture metric read across arms compares different coverage and different sample
+counts.

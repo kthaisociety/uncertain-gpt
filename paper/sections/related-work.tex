@@ -1,30 +1,29 @@
 \section{Related work}
 \label{sec:related}
 
-% One compact paragraph. State what each line of work did, in the fewest
-% words that keep the citation meaningful. No thread-by-thread structure, no
-% characterising a literature, and no restating what this paper does — that
-% belongs in the introduction, once.
+% One compact paragraph, slanted at cost and implementation rather than
+% posterior quality. State what each line of work did, in the fewest words that
+% keep the citation meaningful. No thread-by-thread structure, no
+% characterising a literature, and no restating what this paper does.
 %
 % \nocite{*} is gone: an entry cited nowhere disappears from the
 % bibliography. All 25 entries must stay cited somewhere in the body.
 
-Weight uncertainty was priced as description length by \citet{hinton1993mdl},
-made practical for real networks by \citet{graves2011practical}, and turned
-into Bayes-by-Backprop by \citet{blundell2015weight} through the
-reparameterisation of \citet{kingma2014autoencoding}; \citet{wen2018flipout}
-reduced the cost of drawing a perturbation per example.
-\citet{khan2018vadam} reuse Adam's second moment as a posterior precision,
-\citet{osawa2019practical} scale natural-gradient variational inference to
-ImageNet, and \citet{shen2024ivon} apply it at GPT-2 scale. Structured
-covariances fitted after training include a Kronecker-factored Laplace
-approximation at a trained point \citep{ritter2018scalable}, the same
-approximation as a recipe \citep{daxberger2021laplace}, and a
-low-rank-plus-diagonal factor collected from the SGD trajectory
-\citep{maddox2019swag}, which is the covariance the third arm here learns
-during training instead. Deep ensembles \citep{lakshminarayanan2017simple}
-match or beat variational methods on the benchmarks of \citet{ovadia2019trust}
-at $E$ times the training cost; MC dropout \citep{gal2016dropout} is the other
-cheap baseline, and the network here has no dropout layers. Metrics follow
-\citet{guo2017calibration} for calibration and \citet{kendall2017uncertainties}
-for the aleatoric and epistemic split.
+Weight uncertainty was priced as description length by \citet{hinton1993mdl}, made
+practical for real networks by \citet{graves2011practical}, and turned into
+Bayes-by-Backprop by \citet{blundell2015weight} through the reparameterisation of
+\citet{kingma2014autoencoding}, which pays for a posterior with a second
+parameter-sized tensor and a second optimiser state; \citet{wen2018flipout} move a
+per-example perturbation into the activations. \citet{khan2018vadam} instead reuse
+Adam's second moment as a posterior precision and allocate nothing beyond it,
+\citet{osawa2019practical} scale natural-gradient variational inference to ImageNet,
+and \citet{shen2024ivon} apply it at GPT-2 scale. Covariances fitted after training
+move the cost out of the step: a Kronecker-factored Laplace approximation at a
+trained point \citep{ritter2018scalable}, the same approximation as a recipe
+\citep{daxberger2021laplace}, and a low-rank-plus-diagonal factor from the SGD
+trajectory \citep{maddox2019swag}, which is the covariance the third arm here learns
+during training instead. Deep ensembles \citep{lakshminarayanan2017simple} keep the
+step deterministic and pay $E$ training runs, and match or beat variational methods
+on the benchmarks of \citet{ovadia2019trust}; MC dropout \citep{gal2016dropout} is
+the other cheap baseline, and this network has no dropout layers. Metrics follow
+\citet{guo2017calibration} and \citet{kendall2017uncertainties}.

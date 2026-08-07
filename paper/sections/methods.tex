@@ -1,134 +1,78 @@
-\section{Four posteriors over one network}
+\section{Four optimisation strategies over one network}
 \label{sec:methods}
 
-% What is held fixed lives in the introduction and Section~\ref{sec:setup};
-% do not state it a third time here. Each subsection says only how weights
-% are sampled and how they are updated.
+% Per the brief for this section: what each arm stores, how many parameter-sized
+% passes a step makes over that store, and what that buys. Pass counts belong
+% here; their measured cost belongs in Section~\ref{sec:cost}. The arms'
+% mathematics is in the cited papers and in the repository, not restated here.
 
 The shared header holds the kernels, buffer layout, forward and backward pass,
-dataloader, checkpoint format and evaluation harness. Each arm's source file
-holds only its optimiser.
+dataloader, checkpoint format and evaluation harness; each arm's source file holds only
+its optimiser. Cost is counted there in \emph{touches}, one read or one write of a
+parameter-sized buffer in a step, which at $P = 11{,}061{,}531$ parameters in fp32 is
+$44.2$\,MB. A deterministic AdamW step costs eight: a gradient zeroed and read, weights
+and two moments each read and written.
 
-\subsection{Bayes-by-Backprop}
-\label{sec:m:bbb}
-% Mean-field Gaussian posterior, reparameterised sample per step, ELBO with
-% the KL weight fixed by the data (1/N), not tuned.
+Each arm is counted twice below, as the passes the method needs and as the passes left
+after the redundant ones are folded into one kernel. One observation does most of that
+folding in all three Bayesian arms: a gradient accumulator for a variational parameter
+is write-only, so it never has to reach memory and becomes a register, and the next
+step's draw folds in with it as a function of the parameters the update just wrote. The
+fold is gated as an implementation of the same arithmetic
+(Section~\ref{sec:quality}).
 
-A fully factorised Gaussian posterior over every parameter. Each carries a mean
-$\mu_i$ and an unconstrained $\rho_i$, and a step draws
-\begin{equation}
-  w_i = \mu_i + \mathrm{softplus}(\rho_i)\,\varepsilon_i ,
-  \qquad \varepsilon \sim \mathcal{N}(0, I) ,
-\end{equation}
-one draw shared by the whole batch, reparameterised so the gradient reaches
-both moments \citep{kingma2014autoencoding,blundell2015weight}. The softplus
-keeps the standard deviation positive under AdamW's scale-free step at an
-initialisation near $10^{-3}$. The prior is a zero-mean Gaussian of standard
-deviation $0.1$ with a closed-form KL gradient. The objective is the ELBO,
-$\mathbb{E}_q[\mathrm{NLL}] + \mathrm{KL}(q\|p)/N$, with $N$ the training token
-count read off the loader rather than a tuned weight; a stale value from a
-different corpus cost about a nat of NLL.
+\paragraph{Bayes-by-Backprop.}
+A fully factorised Gaussian, drawn as $w_i = \mu_i +
+\mathrm{softplus}(\rho_i)\,\varepsilon_i$ once per step for the whole batch and
+reparameterised so the gradient reaches both moments
+\citep{kingma2014autoencoding,blundell2015weight}, against a prior of standard
+deviation $0.1$ under an ELBO whose KL weight is $1/N$ for $N$ the training token
+count, read off the loader rather than tuned. It stores $\mu$, $\rho$ and an AdamW
+moment pair for each, where a deterministic model stores weights and one pair, and
+runs AdamW twice a step: eight launches and $32$ touches over ten buffers, the most
+of the four. Folding leaves one launch and $15$ touches over eight, the floor its
+state implies.
 
-This is the largest fixed footprint of the four: ten parameter-sized buffers
-against four for a deterministic model ($\mu$, $\rho$, an AdamW moment pair for
-each, the sampled weights and their gradient, and an accumulator per moment),
-and two AdamW passes per step. Regenerating $\varepsilon$ from the index
-removes an eleventh buffer without changing the arithmetic, and the one-batch
-overfit test reaches the same loss either way.
-
-\subsection{Vadam}
-\label{sec:m:vadam}
-% The second moment doubles as the posterior precision, so the posterior is
-% (almost) free. Note where N enters the scale.
-
-Adam's second moment already estimates a curvature, so \citet{khan2018vadam}
-reuse it as the posterior precision. The posterior is a diagonal Gaussian whose
-mean alone is free, and the scale is read off the optimiser,
+\paragraph{Vadam.}
+Adam's second moment already estimates a curvature, so \citet{khan2018vadam} reuse
+it as the posterior precision and allocate nothing for the posterior. The mean
+alone is free and the scale is read off the optimiser,
 \begin{equation}
   \sigma_i = \frac{1}{\sqrt{N s_i + \lambda}} ,
   \qquad
   w_i = \mu_i + \sigma_i \varepsilon_i ,
   \label{eq:vadam-sigma}
 \end{equation}
-with $s$ the second moment, $N$ the training token count and $\lambda$ the
-prior precision. Figure~1 of \citet{khan2018vadam}, transcribed unchanged:
-\begin{align}
-  m &\leftarrow \gamma_1 m + (1 - \gamma_1)\left(g + \tfrac{\lambda}{N}\mu\right) , \\
-  s &\leftarrow \gamma_2 s + (1 - \gamma_2)\, g \circ g , \\
-  \mu &\leftarrow \mu - \alpha\, \hat{m} \big/ \left(\sqrt{\hat{s}} + \tfrac{\lambda}{N}\right) ,
-\end{align}
-with $\hat{m}, \hat{s}$ the bias-corrected moments and $g$ the gradient at the
-sampled weights. That is one Adam step with the prior folded into the gradient
-and $\lambda/N$ in place of Adam's $\epsilon$, and nothing beyond Adam's own
-$(m, s)$ is allocated.
+with $\lambda = 1/\sigma_{\text{init}}^{2} = 2500$ the prior precision, the
+initialisation rather than a tuned value, and the square root absent from $\sigma$
+following that paper's footnote~2. Its update is Figure~1 of the same paper transcribed
+unchanged, one Adam step with the prior folded into the gradient, so the state is $\mu$
+with Adam's own $m$ and $s$: three launches and $11$ touches against a floor of $9$, two
+touches of slack and no accumulator to delete.
 
-The square root appears in the $\mu$ denominator but not in
-Equation~\ref{eq:vadam-sigma}, where $\sigma$ takes $s$ raw. Footnote~2 of
-\citet{khan2018vadam} states that it ``does not affect a fixed point but might
-still affect the steps taken''; that asymmetry is kept.
+\paragraph{Low-rank plus diagonal covariance.}
+This arm buys correlation with memory. The covariance is $\Sigma = A A^{\top} +
+\mathrm{diag}(d^{\,2})$ at rank $r = 8$, never formed, and a draw is $w_i = \mu_i +
+\sum_{k<r} A_{ik} z_k + d_i \varepsilon_i$ with one $z \sim \mathcal{N}(0, I_r)$ per
+weight matrix per forward pass, shared by all $P$ of its weights; that shared draw
+is the coupling, and the KL reaches $\log\det \Sigma$ through an $r \times r$
+determinant. The posterior covers the four GEMM weight matrices per block, $24$
+tensors holding $10{,}616{,}832$ parameters. Counted per Bayesian layer in units of
+that layer's parameter count, so that $A$ counts as $r$, it costs two launches per
+layer plus four global, $122$ units at $r = 8$, folding to one launch per layer and
+$58$. It is the one arm left above its floor: its KL setup goes through a cuBLAS
+call per layer and a Cholesky on the host, so it cannot fold into the update it
+feeds, needs a reduction over each layer rather than one index, and round-trips $r
+\times r$ matrices through the host.
 
-$\lambda$ is derived, not tuned: matching the initialisation to the prior gives
-$\lambda = 1/\sigma_{\text{init}}^{2} = 2500$ and a prior standard deviation of
-$0.02$. The data's contribution to the precision is $N s$ against $\lambda$, so
-small gradients leave the posterior at the prior rather than merely slowing it
-(Section~\ref{sec:quality}). $N$ belongs to the training run, so evaluation on
-validation or test reads it from the training split.
-
-\subsection{Low-rank plus diagonal covariance}
-\label{sec:m:lowrank}
-% Posterior covariance as a rank-r factor plus a diagonal: what the extra
-% rank buys, and what it costs in memory and per-step time.
-
-This arm replaces mean-field independence with a limited amount of
-correlation,
-\begin{equation}
-  \Sigma = A A^{\top} + \mathrm{diag}(d^{\,2}) ,
-  \qquad A \in \mathbb{R}^{P \times r},\; d \in \mathbb{R}^{P},\; r = 8 .
-\end{equation}
-$\Sigma$ is $P \times P$ and is never formed; sampling uses the factors,
-\begin{equation}
-  w_i = \mu_i + \sum_{k<r} A_{ik} z_k + d_i \varepsilon_i ,
-\end{equation}
-with $\varepsilon$ drawn per weight from the index-keyed Philox stream and one
-$z \sim \mathcal{N}(0, I_r)$ per weight matrix per forward pass, shared by all
-$P$ of its weights. That shared draw is the coupling.
-
-$d = \mathrm{softplus}(\rho_d)$. $A$ is signed, so softplus cannot bound it and
-it takes its own learning rate, $10^{-5}$ against $10^{-4}$ for the means. The
-prior is $\mathcal{N}(0, I/\lambda)$ with $\lambda = 100$, matching the
-mean-field prior standard deviation of $0.1$, and its KL keeps $\Sigma$
-factored through
-\begin{equation}
-  \mathrm{tr}(\Sigma) = \|A\|_F^2 + \|d\|^2 , \qquad
-  \log\det(\Sigma) = \log\det(M) + \textstyle\sum_i \log d_i^2 , \qquad
-  M = I_r + A^{\top} D^{-1} A ,
-\end{equation}
-which turns a $P \times P$ determinant into an $r \times r$ one. The gradients
-follow from the Woodbury identity and reduce to mean-field at $A = 0$, where
-the diagonal's stationary point is $1/\sqrt{\lambda}$.
-
-The posterior covers the four GEMM weight matrices per block ($W_{qkv}$,
-$W_{proj}$, $W_{fc}$, $W_{fc2}$), or $10{,}616{,}832$ of the model's
-$11{,}061{,}531$ parameters, each with its own $A$, $d$ and $z$, so nothing is
-correlated across matrices or blocks. Sampling is a separate kernel: the
-network calls cuBLAS, so there is no GEMM here to fuse into. The rank is
-compile-time so the length-$r$ loops unroll, and a checkpoint is evaluated at
-the rank it was trained at.
-
-\subsection{Deep ensemble (control)}
-\label{sec:m:ensemble}
-% The control arm: no posterior machinery at all, E independently trained
-% members, and the reference the other three are measured against.
-
-$E = 5$ independently trained deterministic models
-\citep{lakshminarayanan2017simple}, differing only in the initialisation seed.
-The network has no dropout and the dataloader is sequential, so initialisation
-is the only source of diversity, and there is no bagging. Member probabilities
-are averaged at inference, never logits.
-
-This arm introduces no kernels: members train through the shared forward and
-backward pass and the shared AdamW, and its evaluation callback returns a
-pointer to member $s$. It is the same network with the Bayesian machinery
-deleted, so every buffer and kernel pass the other three add is attributable to
-their posterior. A Bayesian arm buys its $(S+1)$-th sample for one forward
-pass; this arm's $S$ is capped at the members it paid to train.
+\paragraph{Deep ensemble (control).}
+$E = 5$ deterministic models \citep{lakshminarayanan2017simple} differing only in
+the initialisation seed, which with no dropout and a sequential loader is the only
+source of diversity; member probabilities are averaged at inference, never logits.
+The arm stores no posterior and introduces no kernels, so its step is the
+deterministic two launches and eight touches, already at the floor. It is left
+unfused on purpose: its in-training output is the reference the repository is
+calibrated against and its code is identical in both sweeps, which makes it the
+drift control in Section~\ref{sec:cost}. Its cost sits elsewhere, at $E$ times the
+step, $E$ times the memory, $E$ training runs, and an evaluation-time sample count
+capped at the members it paid to train.

@@ -1,41 +1,43 @@
-\section{What the posterior buys}
+\section{Correctness, and what the cost buys}
 \label{sec:quality}
 
-% Predictive quality and calibration (Table~\ref{tab:quality}), then the
-% uncertainty decomposition and its behaviour off-distribution
-% (Table~\ref{tab:uncertainty}, Table~\ref{tab:ood}). Interpret, do not
-% retype, and do not stage the argument for the reader.
+% Short by design. First that folding did not change what the arms compute, then
+% what the four posteriors return at a fixed step budget. Interpret, do not
+% retype, and do not stage.
 
-The ensemble has the best mixture NLPD of the four and the worst ECE, by close
-to a factor of two; Vadam holds the opposite corner. Mean-field and the
-low-rank arm sit between them, separated by less than the two splits disagree
-about them, so those two are not ranked. Every claim here is read off
-\texttt{test}, and validation agrees on each one except the middle two arms'
-calibration ordering, which reverses between splits.
+Folding is a claim about implementation, so it needs a gate a wrong fold would fail.
+Evaluation at $S = 32$ on validation and test is byte-identical before and after on all
+four arms, and is the weakest of the three checks run: it draws with the unfused sample
+kernels, so a broken training path passes it. Running each fused kernel and the
+sequence it replaces on identical inputs leaves mean-field and Vadam bit-identical on
+every output and the low-rank arm within $1.00$ ULP on $A$ and its two moments, and
+rebuilding with multiply-add contraction disabled makes all three bit-identical, which
+puts the residual in contraction rather than in the arithmetic. And $100$ steps of
+normal-mode training against the pre-folding source reproduce every printed step line
+on all four arms, including both summary lines of the control.
+
+What the cost buys is read from the $100{,}000$-step checkpoints, on both splits with
+neither preferred. The ensemble has the best mixture NLPD and the worst ECE by close to
+a factor of two and Vadam holds the opposite corner (Table~\ref{tab:quality});
+mean-field and the low-rank arm sit between them, separated by less than the two splits
+disagree about them. The ensemble also separates in- from off-distribution input by
+more than twice the margin of any variational arm (Table~\ref{tab:ood}), whose
+epistemic terms barely move on uniform-random token ids.
 
 \begin{table}[t]
   \centering
   \input{\generated/tab-quality}
-  \caption{Predictive quality, in nats, from checkpoints at $100{,}000$ steps
-  over $16{,}384$ positions. Both splits are reported and neither is preferred.
-  ``Single draw'' is one posterior sample for the Bayesian arms and member $0$
-  for the ensemble, comparable within an arm and not across them. ECE is over
-  $15$ bins of next-token argmax confidence \citep{guo2017calibration}.}
+  \caption{Predictive quality, in nats, over $16{,}384$ positions. ``Single draw'' is
+  one posterior sample, or member $0$ for the ensemble: comparable within an arm, not
+  across them.}
   \label{tab:quality}
 \end{table}
-
-The ensemble separates in- from off-distribution input by more than twice the
-margin of either variational arm (Table~\ref{tab:ood}), whose epistemic terms
-barely move off-distribution.
 
 \begin{table}[t]
   \centering
   \input{\generated/tab-uncertainty}
-  \caption{In-distribution decomposition, in nats: the entropy of the mixture,
-  split by Equation~\ref{eq:decomp} into the mean entropy of a draw (aleatoric)
-  and the mean disagreement between draws (epistemic). The two halves are
-  computed independently and their sum asserted against the total at $10^{-5}$;
-  the worst residual behind any number in this paper is
+  \caption{In-distribution decomposition, in nats, by Equation~\ref{eq:decomp}. The
+  worst residual against the asserted identity behind any number here is
   $4.4 \times 10^{-15}$.}
   \label{tab:uncertainty}
 \end{table}
@@ -43,70 +45,37 @@ barely move off-distribution.
 \begin{table}[t]
   \centering
   \input{\generated/tab-ood}
-  \caption{Epistemic uncertainty on the off-distribution stream, in nats.
-  Reported \emph{once} per arm rather than per split: the stream is a fixed
-  synthetic token sequence drawn from one seed, so it is the same measurement
-  on both splits. Only the ratio is split-dependent, through its
-  in-distribution denominator.}
+  \caption{Epistemic uncertainty on the off-distribution stream, in nats, stated once
+  per arm: the stream is one fixed synthetic sequence, so only the ratio's
+  denominator is split-dependent.}
   \label{tab:ood}
 \end{table}
 
-A larger epistemic term is not a better posterior. Vadam's in-distribution
-epistemic is more than three times mean-field's while its separation ratio sits
-with the other variational arms, far below the ensemble's. That spread is prior
-noise rather than learned disagreement, for the reason below.
+A larger epistemic term is not a better posterior. Vadam's in-distribution epistemic
+is more than three times mean-field's (Table~\ref{tab:uncertainty}) while its
+separation ratio sits with the other variational arms, because its spread is the
+prior's: Equation~\ref{eq:vadam-sigma} weighs the data's contribution to the precision,
+$N s$, against $\lambda = 2500$, so the per-token RMS gradient would have to reach
+$\sqrt{\lambda / N} = 5.27 \times 10^{-3}$ where the median observed value is $2.71
+\times 10^{-5}$.\footnote{Read from the trained checkpoint by
+\texttt{dev/vadam\_posterior.py}, the one measurement here taken from a checkpoint
+rather than a logged run.} Noise that does not shrink as the mean fits is also why that
+arm fails the one-batch memorisation gate. The knob would be $\lambda$, and choosing it
+by anything other than the initialisation is a modelling decision this comparison does
+not make.
 
-\paragraph{Why $S = 32$.}
-Epistemic uncertainty is a Monte Carlo estimate over $S$ draws, biased low
-until $S$ converges (Figure~\ref{fig:s-convergence}). Mean-field is flat by
-$S = 32$ and confirmed flat out to $S = 128$. Under-sampling flatters the
-variational arms: from $S = 8$ to $S = 32$ their in-distribution epistemic
-grows faster than their off-distribution epistemic, so their separation ratios
-\emph{fall} while the ensemble stays pinned at $S = E$. Converging $S$ made the
-headline gap larger, not smaller.
-
-The low-rank arm gains a further few percent of epistemic between $S = 32$ and
-$S = 64$ and only then stops, so at $S = 32$ mean-field sits at its limit and
-the low-rank arm slightly below its own. That asymmetry favours mean-field in a
-head-to-head and is small against the gaps this section reads. Moving the
-convention to $S = 64$ would remove it and costs no retraining.
+Every uncertainty number above carries its $S$, because the estimator is Monte Carlo
+over $S$ draws and biased low until it converges
+(Figure~\ref{fig:s-convergence}). Mean-field is flat by $S = 32$ and confirmed flat to
+$S = 128$, though its ECE rises at every doubling over that range while its mixture
+NLPD improves; the low-rank arm gains a few percent of epistemic between $S = 32$ and
+$S = 64$, so whether the convention moves to $S = 64$ is open.
 
 \begin{figure}[t]
   \centering
   \input{\generated/fig-s-convergence}
-  \caption{Epistemic uncertainty against posterior samples $S$, validation
-  split, same positions as Table~\ref{tab:uncertainty}. The foot at $S = 1$ is
-  exactly zero by construction, since one sample disagrees with nothing, and
-  the generator refuses to plot if it is not. The ensemble is a marked point,
-  not a curve: its $S$ is the number of members it was paid to train.}
+  \caption{Epistemic uncertainty against posterior samples $S$, validation split. The
+  foot at $S = 1$ is exactly zero by construction, and the ensemble is a marked point
+  at the number of members it was paid to train.}
   \label{fig:s-convergence}
 \end{figure}
-
-\paragraph{Calibration degrades with $S$, in one arm.}
-Mean-field's ECE rises at every doubling of $S$ from $2$ to $128$ while its
-mixture NLPD improves, with no retraining between the two ends. The low-rank
-arm does not share the pattern, which argues against a binning artifact: if the
-estimator or the bin count were responsible, both arms would show it. It was
-not chased further. Any ECE quoted for mean-field carries its $S$ or means
-nothing.
-
-\paragraph{Vadam's posterior is the prior, and that is structural.}
-The arm's mean left initialisation almost completely and its training loss fell
-like the others'. Its posterior \emph{scale} did not move.
-Equation~\ref{eq:vadam-sigma} makes the data's contribution to the precision
-$N s$, weighed against $\lambda = 2500$, so for the data to matter the
-per-token RMS gradient has to reach $\sqrt{\lambda / N} = 5.27 \times 10^{-3}$.
-The median observed value is $2.71 \times 10^{-5}$, short by a factor of
-$195$,\footnote{Read from the trained checkpoint by
-\texttt{dev/vadam\_posterior.py}, the one measurement in this paper taken from
-a checkpoint rather than a logged run; the rest of the arithmetic is $\lambda$
-and $N$.} and the minibatch bias in \citeauthor{khan2018vadam}'s own Theorem~1
-accounts for at most a factor of $16$ of that at this batch size. The posterior
-sits at the prior in almost every coordinate, and the arm reports the prior's
-spread as epistemic uncertainty.
-
-The kernels, the sampler and the transcription were checked before this was
-concluded (Section~\ref{sec:limitations}), and rerunning the arm reproduces it.
-The knob that would change it is $\lambda$, and choosing $\lambda$ by anything
-other than the initialisation is a modelling decision this comparison does not
-get to make.
