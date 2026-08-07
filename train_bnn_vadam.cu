@@ -32,6 +32,12 @@
  Build:   make train_bnn_vadam
  Run:     ./train_bnn_vadam            train on TinyShakespeare
           ./train_bnn_vadam overfit    memorize one batch (smoke test)
+          ./train_bnn_vadam eval [steps] [S] [batches] [split] [lambda]
+                                       NLPD / ECE / aleatoric-epistemic-
+                                       total from a SAVED checkpoint, on
+                                       held-out val or test. Never trains.
+                                       sigma is derived, so eval needs the
+                                       TRAINING N and lambda — see below.
 
 -----------------------------------------------------------------------------
  THE TWO ALGORITHM INPUTS THAT ARE MODELING CHOICES (constants below):
@@ -126,10 +132,94 @@ __global__ void k_vadam_stats(float *kl_part, float *sig_part,
 }
 
 /* ===================================================================== *
+ * eval — uncertainty from a SAVED checkpoint, no training.
+ *
+ *     ./train_bnn_vadam eval [steps] [S] [batches] [split] [lambda]
+ *
+ * The callback is k_vadam_sample with the step index replaced by the
+ * sample index — the same sampler training used, so the posterior being
+ * measured is the one that was fit.
+ *
+ * TWO INPUTS THIS ARM CANNOT READ OFF ITS CHECKPOINT, because sigma is
+ * DERIVED rather than stored (only s is saved):
+ *
+ *   N        sigma = 1/sqrt(N*s + lambda) has the TRAINING token count
+ *            inside it. Evaluating on val does not change N — using the
+ *            val split's 5M here instead of the train split's 90M would
+ *            inflate every sigma by ~4x and silently corrupt the
+ *            comparison. So N is read from DATA_TRAIN's header (1 KB,
+ *            no tokens loaded), exactly as the trainer computed it.
+ *   lambda   defaults to the same DERIVED value the trainer uses,
+ *            1/init_std^2. If a checkpoint was trained with an explicit
+ *            lambda (argv[3] on the train path), pass the same value here
+ *            or the sigmas will not match the fitted posterior.
+ * ===================================================================== */
+typedef struct { float *w, *mu, *s; size_t n; int grid; float N, lambda; } VadamCtx;
+
+static const float *vadam_draw(int s, void *vctx) {
+    VadamCtx *c = (VadamCtx *)vctx;
+    k_vadam_sample<<<c->grid, BS>>>(c->w, c->mu, c->s, c->n, c->N, c->lambda,
+                                    UQ_EVAL_SEED, s + 1);
+    CUDA_CHECK(cudaGetLastError());
+    return c->w;
+}
+
+static int vadam_eval(int argc, char **argv) {
+    if (uq_selftest()) return 1;
+    UQArgs u = uq_parse_args(argc, argv);
+    CUBLAS_CHECK(cublasCreate(&cublas_handle));
+
+    Config cfg = { .B = 4, .T = 64, .C = 384, .V = VOCAB, .NH = 6, .maxT = 1024, .L = NBLOCKS };
+    ParamOff p = param_offsets(cfg);
+    ActOff   a = act_offsets(cfg);
+    size_t n = p.total, pb = n * sizeof(float);
+    int BT = cfg.B * cfg.T;
+
+    const float MU_INIT_STD = 0.02f;                       // same as training
+    VadamCtx c;
+    c.n = n; c.grid = ceil_div((int)n, BS);
+    c.N      = (float)loader_count(DATA_TRAIN);            // the TRAINING N
+    c.lambda = 1.0f / (MU_INIT_STD * MU_INIT_STD);
+    if (argc > 6) c.lambda = (float)atof(argv[6]);
+    printf("vadam eval: N = %.0f (from %s) | lambda = %.0f | prior sigma = %.4f\n",
+           c.N, DATA_TRAIN, c.lambda, 1.0f / sqrtf(c.lambda));
+
+    CUDA_CHECK(cudaMalloc(&c.mu, pb));
+    CUDA_CHECK(cudaMalloc(&c.s,  pb));
+    CUDA_CHECK(cudaMalloc(&c.w,  pb));
+    if (ckpt_load("vadam", "mu", c.mu, n, cfg, u.steps) < 0) return 1;
+    if (ckpt_load("vadam", "s",  c.s,  n, cfg, u.steps) < 0) return 1;
+
+    float *d_acts; int *d_inp, *d_tgt;
+    CUDA_CHECK(cudaMalloc(&d_acts, a.total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_inp, BT * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_tgt, BT * sizeof(int)));
+    int   *h_inp    = (int *)malloc(BT * sizeof(int));
+    int   *h_tgt    = (int *)malloc(BT * sizeof(int));
+    float *h_losses = (float *)malloc(BT * sizeof(float));
+
+    Loader ld; loader_init(&ld, uq_split_path(u.split));
+    UQSpec spec = { .cfg = cfg, .S = u.S, .nbatches = u.nbatches,
+                    .arm = "vadam", .split = u.split, .mix_label = "mixture",
+                    .s_fixed_by_arm = 0, .fixed_batch = 0 };
+    UQResult r;
+    int bad = uq_evaluate(&spec, vadam_draw, &c, &ld, d_acts, d_inp, d_tgt,
+                          h_inp, h_tgt, h_losses, &r);
+    if (!bad) uq_report(&spec, &r);
+
+    free(h_inp); free(h_tgt); free(h_losses); free(ld.tokens);
+    cudaFree(c.mu); cudaFree(c.s); cudaFree(c.w);
+    cudaFree(d_acts); cudaFree(d_inp); cudaFree(d_tgt);
+    cublasDestroy(cublas_handle);
+    return bad;
+}
+
+/* ===================================================================== *
  * main — same shape as the BBB main, minus everything Vadam deleted.
  * ===================================================================== */
 
 int main(int argc, char **argv) {
+    if (argc > 1 && argv[1][0] == 'e') return vadam_eval(argc, argv);
     bool overfit = (argc > 1 && argv[1][0] == 'o');
 
     cudaDeviceProp prop;
@@ -138,14 +228,25 @@ int main(int argc, char **argv) {
            prop.totalGlobalMem / 1e9);
     CUBLAS_CHECK(cublasCreate(&cublas_handle));
 
-    Config cfg = { .B = 4, .T = 64, .C = 768, .V = VOCAB, .NH = 12, .maxT = 1024, .L = NBLOCKS };
+    Config cfg = { .B = 4, .T = 64, .C = 384, .V = VOCAB, .NH = 6, .maxT = 1024, .L = NBLOCKS };
     ParamOff p = param_offsets(cfg);
     ActOff   a = act_offsets(cfg);
     size_t n = p.total;
     int BT = cfg.B * cfg.T;
 
     // ---- the algorithm's inputs -------------------------------------------
-    const float LAMBDA = 100.0f;   // prior precision; sigma_prior = 1/sqrt = 0.1
+    // Vadam has no KL weight — the prior lives inside sigma = 1/sqrt(N*s+lambda),
+    // so LAMBDA is where the same "stale prior scale" mistake shows up. It was
+    // 100 (sigma_prior = 0.1), which is FIVE TIMES the scale the weights are
+    // initialized at (0.02). That injects 500% relative noise and is why this
+    // arm diverged on char-level data.
+    //
+    // Derived instead: the prior std should match the scale the weights live
+    // at, so lambda = 1/init_std^2. At init_std = 0.02 that is 2500, giving a
+    // step-1 sigma of exactly 0.02.
+    const float MU_INIT_STD = 0.02f;
+    float LAMBDA = 1.0f / (MU_INIT_STD * MU_INIT_STD);   // = 2500
+    if (argc > 3) LAMBDA = (float)atof(argv[3]);         // explicit sweep value
     const float S0     = 0.0f;     // s init; 0 -> step-1 sigma is exactly the prior
     const float LR = overfit ? 1e-3f : 1e-4f;   // same lr policy as the BBB file
     const float G1 = 0.9f, G2 = 0.999f;
@@ -283,6 +384,10 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (!overfit) {
+        ckpt_save("vadam", "mu", d_mu, n, cfg, STEPS);
+        ckpt_save("vadam", "s",  d_s,  n, cfg, STEPS);   // sigma is derived from s
+    }
     printf("\ndone.\n");
     free(h_inp); free(h_tgt); free(h_losses); free(h_klp); free(h_sigp); free(h_smin); free(h_smax);
     free(ld.tokens);

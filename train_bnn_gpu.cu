@@ -13,6 +13,10 @@
  Build:   make train_bnn_gpu
  Run:     ./train_bnn_gpu            train on TinyShakespeare
           ./train_bnn_gpu overfit    memorize one batch (the smoke test)
+          ./train_bnn_gpu eval [steps] [S] [batches] [split]
+                                     NLPD / ECE / aleatoric-epistemic-total
+                                     from a SAVED checkpoint, on held-out
+                                     val or test. Never trains.
 
 -----------------------------------------------------------------------------
  WHAT THIS COSTS, AND WHY IT IS THE THING TO BEAT
@@ -35,6 +39,37 @@
  idea: eps is regenerated with Philox rather than stored, which removes a
  340 MB buffer and ~680 MB/step of traffic. Kept because it changes no math
  whatsoever — the overfit test reaches the same loss either way.
+
+-----------------------------------------------------------------------------
+ THE KL WEIGHT IS DERIVED, NOT TUNED.  (recorded because getting this wrong
+ cost 1.0 nats and briefly made Bayesian methods look categorically worse
+ than they are)
+
+ The ELBO is
+
+     loss = E_q[NLL]  +  KL(q || p) / N
+
+ The 1/N is not a knob. It falls out of the KL being a per-DATASET quantity
+ while the reported NLL is a per-TOKEN mean. N = the training token count, so
+ KLW = 1/ld.n, computed from the loader.
+
+ Measured on 6 blocks, char-level TinyShakespeare, 2000 steps:
+
+     KLW = 1e-3  (hardcoded, stale)   nll 3.4328
+     KLW = 1e-4                       nll 2.7034
+     KLW = 1e-6  (= 1/N, correct)     nll 2.4389
+     KLW = 0                          nll 2.4068
+     deterministic single model       nll 2.3167
+
+ At the correct weight the cost of being Bayesian is 0.12 nats. At the stale
+ one it looked like 1.1. The value had been carried over from an earlier
+ experiment with a different dataset and parameter count and never re-derived
+ — which is exactly why it is now computed rather than typed.
+
+ This is bottleneck E ("KL weight sensitivity") from the project taxonomy,
+ measured: three orders of magnitude in one constant move the loss by a full
+ nat. Worth reporting, since BNN papers commonly quote a tuned KL weight
+ without deriving it.
 =============================================================================
 */
 
@@ -116,10 +151,74 @@ __global__ void k_kl_stats(float *kl_part, float *sig_part,
 
 
 /* ===================================================================== *
+ * eval — uncertainty from a SAVED checkpoint, no training.
+ *
+ *     ./train_bnn_gpu eval [steps] [S] [batches] [split]
+ *
+ * The arm's whole contribution to the shared harness is one callback: draw
+ * s is one reparameterized sample w = mu + softplus(rho) * eps, i.e. the
+ * training sampler with the step index replaced by the sample index. From
+ * there gpt2_kernels.cuh does exactly what it does for the other three.
+ * ===================================================================== */
+typedef struct { float *w, *mu, *rho; size_t n; int grid; } BBBCtx;
+
+static const float *bbb_draw(int s, void *vctx) {
+    BBBCtx *c = (BBBCtx *)vctx;
+    // step = s+1 on the eval seed: S independent draws, from a Philox stream
+    // no training step ever consumed.
+    k_bayes_sample<<<c->grid, BS>>>(c->w, c->mu, c->rho, c->n, UQ_EVAL_SEED, s + 1);
+    CUDA_CHECK(cudaGetLastError());
+    return c->w;
+}
+
+static int bbb_eval(int argc, char **argv) {
+    if (uq_selftest()) return 1;
+    UQArgs u = uq_parse_args(argc, argv);
+    CUBLAS_CHECK(cublasCreate(&cublas_handle));
+
+    Config cfg = { .B = 4, .T = 64, .C = 384, .V = VOCAB, .NH = 6, .maxT = 1024, .L = NBLOCKS };
+    ParamOff p = param_offsets(cfg);
+    ActOff   a = act_offsets(cfg);
+    size_t n = p.total, pb = n * sizeof(float);
+    int BT = cfg.B * cfg.T;
+
+    BBBCtx c; c.n = n; c.grid = ceil_div((int)n, BS);
+    CUDA_CHECK(cudaMalloc(&c.mu, pb));
+    CUDA_CHECK(cudaMalloc(&c.rho, pb));
+    CUDA_CHECK(cudaMalloc(&c.w, pb));
+    if (ckpt_load("bbb", "mu",  c.mu,  n, cfg, u.steps) < 0) return 1;
+    if (ckpt_load("bbb", "rho", c.rho, n, cfg, u.steps) < 0) return 1;
+
+    float *d_acts; int *d_inp, *d_tgt;
+    CUDA_CHECK(cudaMalloc(&d_acts, a.total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_inp, BT * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_tgt, BT * sizeof(int)));
+    int   *h_inp    = (int *)malloc(BT * sizeof(int));
+    int   *h_tgt    = (int *)malloc(BT * sizeof(int));
+    float *h_losses = (float *)malloc(BT * sizeof(float));
+
+    Loader ld; loader_init(&ld, uq_split_path(u.split));
+    UQSpec spec = { .cfg = cfg, .S = u.S, .nbatches = u.nbatches,
+                    .arm = "bbb", .split = u.split, .mix_label = "mixture",
+                    .s_fixed_by_arm = 0, .fixed_batch = 0 };
+    UQResult r;
+    int bad = uq_evaluate(&spec, bbb_draw, &c, &ld, d_acts, d_inp, d_tgt,
+                          h_inp, h_tgt, h_losses, &r);
+    if (!bad) uq_report(&spec, &r);
+
+    free(h_inp); free(h_tgt); free(h_losses); free(ld.tokens);
+    cudaFree(c.mu); cudaFree(c.rho); cudaFree(c.w);
+    cudaFree(d_acts); cudaFree(d_inp); cudaFree(d_tgt);
+    cublasDestroy(cublas_handle);
+    return bad;
+}
+
+/* ===================================================================== *
  * main
  * ===================================================================== */
 
 int main(int argc, char **argv) {
+    if (argc > 1 && argv[1][0] == 'e') return bbb_eval(argc, argv);
     bool overfit = (argc > 1 && argv[1][0] == 'o');
 
     cudaDeviceProp prop;
@@ -128,7 +227,7 @@ int main(int argc, char **argv) {
            prop.totalGlobalMem / 1e9);
     CUBLAS_CHECK(cublasCreate(&cublas_handle));
 
-    Config cfg = { .B = 4, .T = 64, .C = 768, .V = VOCAB, .NH = 12, .maxT = 1024, .L = NBLOCKS };
+    Config cfg = { .B = 4, .T = 64, .C = 384, .V = VOCAB, .NH = 6, .maxT = 1024, .L = NBLOCKS };
     if (cfg.C / cfg.NH != HS) { printf("HS must equal C/NH\n"); return 1; }
 
     ParamOff p = param_offsets(cfg);
@@ -137,7 +236,12 @@ int main(int argc, char **argv) {
     int BT = cfg.B * cfg.T;
 
     const float SP = 0.1f;                  // prior sigma
-    const float KLW = overfit ? 0.0f : 1e-3f;
+    // KLW is DERIVED from the dataset size once the loader is up (see below).
+    // It is NOT a free knob: the ELBO is  E_q[NLL] + KL/N,  and that 1/N falls
+    // out of the KL being a per-DATASET quantity while the reported NLL is a
+    // per-TOKEN mean. See the header for what hardcoding it cost.
+    float KLW = 0.0f;
+    const bool klw_override = (argc > 3);   // explicit sweep value, if given
     // Overfit mode wants a big lr on purpose: the test is "can 256 tokens be
     // memorized at all", and at 1e-4 it only gets to nll 7.6 in 200 steps —
     // which proves the gradients point downhill but not that the chain is
@@ -205,6 +309,11 @@ int main(int argc, char **argv) {
 
     Loader ld;
     loader_init(&ld, DATA_TRAIN);
+
+    // ---- the ELBO's KL weight, derived --------------------------------------
+    if (!overfit) KLW = 1.0f / (float)ld.n;
+    if (klw_override) KLW = (float)atof(argv[3]);
+
     if (overfit) {
         // One batch, reused forever. If the model cannot memorize 256 tokens,
         // something is wired wrong — this catches what a gradient check cannot:
@@ -285,6 +394,10 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (!overfit) {
+        ckpt_save("bbb", "mu",  d_mu,  n, cfg, STEPS);
+        ckpt_save("bbb", "rho", d_rho, n, cfg, STEPS);
+    }
     printf("\ndone.\n");
     free(h_inp); free(h_tgt); free(h_losses); free(h_klp); free(h_sigp); free(h_smin); free(h_smax);
     free(ld.tokens);

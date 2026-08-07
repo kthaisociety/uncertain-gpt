@@ -80,6 +80,11 @@
  Run:     ./train_bnn_lowrank                 train on TinyShakespeare
           ./train_bnn_lowrank overfit         memorize one batch
           ./train_bnn_lowrank check           the five correctness checks
+          ./train_bnn_lowrank eval [steps] [S] [batches] [split]
+                                              NLPD / ECE / aleatoric-
+                                              epistemic-total from a SAVED
+                                              checkpoint, held-out data.
+                                              Build at the checkpoint's rank.
 =============================================================================
 */
 
@@ -309,9 +314,120 @@ static int chol_logdet_inv(const float *Min, float *Minv, double *logdet) {
 }
 
 /* ===================================================================== *
+ * eval — uncertainty from a SAVED checkpoint, no training.
+ *
+ *     ./train_bnn_lowrank eval [steps] [S] [batches] [split]
+ *
+ * The callback is the training sampler verbatim: one fresh z per Bayesian
+ * layer (the shared factor that couples that layer's P weights), theta
+ * copied into w, then w = theta + A z + softplus(rhod) * eps over the four
+ * GEMMs. Step index -> sample index; both Philox streams move with it, and
+ * they stay disjoint from each other exactly as in training.
+ *
+ * RANK IS COMPILE-TIME. A checkpoint trained at R=8 has Pb*8 floats in its
+ * A file, so evaluating it with a binary built at R=4 is caught by
+ * ckpt_load's element-count check rather than read as garbage. Build the
+ * eval binary at the rank the checkpoint was trained at.
+ * ===================================================================== */
+
+// The same Bayesian-layer list main() builds inline. Kept as a separate
+// function rather than factored out of main(), to keep this change additive
+// while train_bnn_lowrank.cu is being restructured on another branch; the two
+// should be collapsed into one caller once both have landed. If you add a
+// Bayesian layer, change BOTH.
+static size_t lowr_build_layers(BLayer *L, Config cfg) {
+    ParamOff po = param_offsets(cfg);
+    int C = cfg.C;
+    for (int b = 0; b < cfg.L; b++) {
+        L[4*b+0] = (BLayer){ PBLK(po,b,qw), 0, 0, C * 3 * C, "W_qkv"  };
+        L[4*b+1] = (BLayer){ PBLK(po,b,pw), 0, 0, C * C,     "W_proj" };
+        L[4*b+2] = (BLayer){ PBLK(po,b,w1), 0, 0, C * 4 * C, "W_fc"   };
+        L[4*b+3] = (BLayer){ PBLK(po,b,w2), 0, 0, 4 * C * C, "W_fc2"  };
+    }
+    size_t Pb = 0;
+    for (int l = 0; l < 4 * cfg.L; l++) {
+        L[l].boff = Pb; L[l].aoff = Pb * RANK; Pb += L[l].P;
+    }
+    return Pb;
+}
+
+typedef struct {
+    float *w, *theta, *A, *rhod, *z;
+    BLayer *L; int nbl; size_t n;
+} LowRCtx;
+
+static const float *lowr_draw(int s, void *vctx) {
+    LowRCtx *c = (LowRCtx *)vctx;
+    k_draw_z<<<ceil_div(c->nbl * RANK, 128), 128>>>(
+        c->z, c->nbl, UQ_EVAL_SEED ^ 0x9E3779B9ull, s + 1);
+    // w = theta everywhere; the four GEMM regions are then overwritten.
+    CUDA_CHECK(cudaMemcpy(c->w, c->theta, c->n * sizeof(float),
+                          cudaMemcpyDeviceToDevice));
+    for (int l = 0; l < c->nbl; l++)
+        k_lowrank_sample<<<ceil_div(c->L[l].P, BS), BS>>>(
+            c->w, c->theta, c->A, c->rhod, c->z + l * RANK,
+            c->L[l].poff, c->L[l].aoff, c->L[l].boff, c->L[l].P,
+            UQ_EVAL_SEED, s + 1);
+    CUDA_CHECK(cudaGetLastError());
+    return c->w;
+}
+
+static int lowr_eval(int argc, char **argv) {
+    if (uq_selftest()) return 1;
+    UQArgs u = uq_parse_args(argc, argv);
+    CUBLAS_CHECK(cublasCreate(&cublas_handle));
+
+    Config cfg = { .B = 4, .T = 64, .C = 384, .V = VOCAB, .NH = 6, .maxT = 1024, .L = NBLOCKS };
+    ActOff a = act_offsets(cfg);
+    size_t n = param_offsets(cfg).total, pb = n * sizeof(float);
+    int BT = cfg.B * cfg.T;
+
+    LowRCtx c;
+    c.nbl = 4 * cfg.L;
+    c.L   = (BLayer *)malloc(c.nbl * sizeof(BLayer));
+    size_t Pb = lowr_build_layers(c.L, cfg);
+    c.n = n;
+    printf("lowr eval: rank %d, Bayesian over %zu params (%.1f%% — the 4 GEMMs only)\n",
+           RANK, Pb, 100.0 * Pb / n);
+
+    CUDA_CHECK(cudaMalloc(&c.theta, pb));
+    CUDA_CHECK(cudaMalloc(&c.w,     pb));
+    CUDA_CHECK(cudaMalloc(&c.A,     Pb * RANK * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&c.rhod,  Pb * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&c.z,     c.nbl * RANK * sizeof(float)));
+    if (ckpt_load("lowr", "theta", c.theta, n,          cfg, u.steps) < 0) return 1;
+    if (ckpt_load("lowr", "A",     c.A,     Pb * RANK,  cfg, u.steps) < 0) return 1;
+    if (ckpt_load("lowr", "rhod",  c.rhod,  Pb,         cfg, u.steps) < 0) return 1;
+
+    float *d_acts; int *d_inp, *d_tgt;
+    CUDA_CHECK(cudaMalloc(&d_acts, a.total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_inp, BT * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_tgt, BT * sizeof(int)));
+    int   *h_inp    = (int *)malloc(BT * sizeof(int));
+    int   *h_tgt    = (int *)malloc(BT * sizeof(int));
+    float *h_losses = (float *)malloc(BT * sizeof(float));
+
+    Loader ld; loader_init(&ld, uq_split_path(u.split));
+    UQSpec spec = { .cfg = cfg, .S = u.S, .nbatches = u.nbatches,
+                    .arm = "lowr", .split = u.split, .mix_label = "mixture",
+                    .s_fixed_by_arm = 0, .fixed_batch = 0 };
+    UQResult r;
+    int bad = uq_evaluate(&spec, lowr_draw, &c, &ld, d_acts, d_inp, d_tgt,
+                          h_inp, h_tgt, h_losses, &r);
+    if (!bad) uq_report(&spec, &r);
+
+    free(h_inp); free(h_tgt); free(h_losses); free(ld.tokens); free(c.L);
+    cudaFree(c.theta); cudaFree(c.w); cudaFree(c.A); cudaFree(c.rhod); cudaFree(c.z);
+    cudaFree(d_acts); cudaFree(d_inp); cudaFree(d_tgt);
+    cublasDestroy(cublas_handle);
+    return bad;
+}
+
+/* ===================================================================== *
  * main
  * ===================================================================== */
 int main(int argc, char **argv) {
+    if (argc > 1 && argv[1][0] == 'e') return lowr_eval(argc, argv);
     bool overfit = (argc > 1 && argv[1][0] == 'o');
     bool checks  = (argc > 1 && argv[1][0] == 'c');
 
@@ -321,7 +437,7 @@ int main(int argc, char **argv) {
            prop.minor, prop.totalGlobalMem / 1e9, RANK);
     CUBLAS_CHECK(cublasCreate(&cublas_handle));
 
-    Config cfg = { .B = 4, .T = 64, .C = 768, .V = VOCAB, .NH = 12, .maxT = 1024, .L = NBLOCKS };
+    Config cfg = { .B = 4, .T = 64, .C = 384, .V = VOCAB, .NH = 6, .maxT = 1024, .L = NBLOCKS };
     ParamOff po = param_offsets(cfg);
     ActOff   a  = act_offsets(cfg);
     size_t n = po.total;
@@ -343,7 +459,10 @@ int main(int argc, char **argv) {
     }
 
     const float LAMBDA = 100.0f;                 // prior precision, sigma_p = 0.1
-    const float KLW    = overfit ? 0.0f : 1e-3f; // same policy as BBB
+    // DERIVED from the dataset once the loader is up — see train_bnn_gpu.cu's
+    // header. The ELBO is E_q[NLL] + KL/N; hardcoding this cost 1.0 nats there
+    // and this file inherited the same stale 1e-3.
+    float KLW = 0.0f;
     const float LR = overfit ? 1e-3f : 1e-4f;
     // SEPARATE lr for the variance group (A and rhod). AdamW's step is
     // scale-free — about `lr` regardless of gradient size — so one lr cannot
@@ -588,6 +707,8 @@ int main(int argc, char **argv) {
     float *h_losses = (float *)malloc(BT * sizeof(float));
     Loader ld;
     loader_init(&ld, DATA_TRAIN);
+    if (!overfit) KLW = 1.0f / (float)ld.n;      // ELBO: KL is per-dataset
+    if (argc > 3) KLW = (float)atof(argv[3]);    // explicit sweep value
     printf("\n%s: %d steps, lambda %.0f, kl_weight %.0e\n\n",
            overfit ? "OVERFIT MODE" : "TRAINING", STEPS, LAMBDA, KLW);
     if (overfit) {
@@ -694,6 +815,11 @@ int main(int argc, char **argv) {
            RANK, Pb, 100.0 * Pb / n);
     printf("summary: A = %.0f MB; low-rank costs MORE than mean-field, the case is quality\n",
            ab / 1e6);
+    if (!overfit) {
+        ckpt_save("lowr", "theta", d_theta, n,        cfg, STEPS);
+        ckpt_save("lowr", "A",     d_A,     Pb*RANK,  cfg, STEPS);
+        ckpt_save("lowr", "rhod",  d_rhod,  Pb,       cfg, STEPS);
+    }
     printf("\ndone.\n");
     return 0;
 }

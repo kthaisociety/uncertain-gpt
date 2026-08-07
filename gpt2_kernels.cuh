@@ -52,9 +52,18 @@
  the large-batch scaling experiment affordable. Regenerate the .bin files
  with `python3 data/prepare_char.py`.
 --------------------------------------------------------------------------- */
-#define VOCAB      65
-#define DATA_TRAIN "data/tinyshakespeare/tiny_shakespeare_char_train.bin"
-#define DATA_VAL   "data/tinyshakespeare/tiny_shakespeare_char_val.bin"
+// text8: 90M training tokens, vocab 27. TinyShakespeare had 1.0M tokens
+// against 43M parameters — 43x more parameters than data — and the ELBO's KL
+// term is per-dataset, so the prior outweighed the data ~35:1 even at the
+// correct weight. Measured on Vadam, where N sits inside sigma:
+//     N=1e6  best-informed parameter 35% data-driven
+//     N=1e8  best-informed parameter 98% data-driven
+// text8 is also the standard char-level LM benchmark. Regenerate the .bin
+// files with `python3 data/prepare_text8.py`.
+#define VOCAB      27
+#define DATA_TRAIN "data/text8/text8_train.bin"
+#define DATA_VAL   "data/text8/text8_val.bin"
+#define DATA_TEST  "data/text8/text8_test.bin"   // Mikolov split: 90M/5M/5M
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -862,6 +871,40 @@ static void loader_next(Loader *ld, int *h_inp, int *h_tgt, int BT) {
 }
 
 /* ===================================================================== *
+ * RUN PERSISTENCE — so a 4-hour run never has to be repeated.
+ *
+ * Two separate things get saved:
+ *   runs/results.csv   the measured numbers (written by scorecard.c)
+ *   runs/*.bin         the trained parameters, written here
+ *
+ * The checkpoints matter more. The uncertainty evaluation (NLPD, ECE,
+ * epistemic ID/OOD at S samples) is still unwritten for three of four arms.
+ * When it lands, it must run against ALREADY TRAINED models — otherwise
+ * every new metric costs another full training run.
+ *
+ * Format: 8-int header {magic, n_lo, C, L, V, NH, steps, n_hi} then n floats.
+ * ===================================================================== */
+
+static void ckpt_save(const char *arm, const char *what, const float *d_buf,
+                      size_t n, Config cfg, int steps) {
+    if (system("mkdir -p runs") != 0) { /* already exists */ }
+    char path[512];
+    snprintf(path, sizeof path, "runs/%s_C%d_L%d_%dk_%s.bin",
+             arm, cfg.C, cfg.L, steps / 1000, what);
+    float *h = (float *)malloc(n * sizeof(float));
+    if (!h) { printf("ckpt: host alloc failed for %s\n", path); return; }
+    CUDA_CHECK(cudaMemcpy(h, d_buf, n * sizeof(float), cudaMemcpyDeviceToHost));
+    FILE *f = fopen(path, "wb");
+    if (!f) { printf("ckpt: cannot write %s\n", path); free(h); return; }
+    int hdr[8] = { 20240520, (int)(n & 0xffffffffu), cfg.C, cfg.L,
+                   cfg.V, cfg.NH, steps, (int)(n >> 32) };
+    fwrite(hdr, sizeof(int), 8, f);
+    fwrite(h, sizeof(float), n, f);
+    fclose(f); free(h);
+    printf("ckpt: %s  (%zu floats, %.0f MB)\n", path, n, n * 4 / 1e6);
+}
+
+/* ===================================================================== *
  * AdamW. Lives here rather than in an optimizer file because it is the
  * GENERIC update every variant leans on: BBB runs it on mu and rho, the
  * deep-ensemble baseline runs it on each member. The header's "no optimizer
@@ -879,6 +922,406 @@ __global__ void k_adamw(float *params, const float *grads, float *m, float *v,
         m[i] = mi; v[i] = vi;
         params[i] -= lr * ((mi / bc1) / (sqrtf(vi / bc2) + eps) + wd * params[i]);
     }
+}
+
+/* =====================================================================  *
+ *                                                                        *
+ *   THE SHARED UNCERTAINTY EVALUATION HARNESS                            *
+ *                                                                        *
+ * Everything below is new code that no training step touches. It exists   *
+ * so that the four arms produce the SAME uncertainty numbers computed by  *
+ * the SAME arithmetic, which is the only way the comparison means         *
+ * anything. It lived inside train_ensemble.cu until now, which is why     *
+ * three of four arms had no uncertainty numbers at all.                   *
+ *                                                                        *
+ * ---------------------------------------------------------------------- *
+ * THE DECOMPOSITION (per token, nats, double precision)                   *
+ *                                                                        *
+ *     p_bar(y|x) = (1/S) sum_s p_s(y|x)        MIX PROBABILITIES, never   *
+ *                                              logits — a logit average   *
+ *                                              is a geometric mean and    *
+ *                                              carries the wrong          *
+ *                                              uncertainty.               *
+ *     total     = H[p_bar]                                                *
+ *     aleatoric = (1/S) sum_s H[p_s]                                      *
+ *     epistemic = (1/S) sum_s KL(p_s || p_bar)                            *
+ *                                                                        *
+ * total = aleatoric + epistemic is EXACT ALGEBRA, for any S >= 1 and for  *
+ * any way of drawing the samples:                                         *
+ *                                                                        *
+ *   alea + epi = -(1/S) SS p_sy log p_sy + (1/S) SS p_sy log p_sy         *
+ *                                        - (1/S) SS p_sy log p_bar_y      *
+ *              = - sum_y [(1/S) sum_s p_sy] log p_bar_y                   *
+ *              = - sum_y p_bar_y log p_bar_y  =  H[p_bar]                 *
+ *                                                                        *
+ * Both halves are computed DIRECTLY (epistemic is never derived as the    *
+ * difference), so asserting the identity actually tests something. It is  *
+ * the correctness gate of this whole file: because the algebra is         *
+ * independent of the posterior, a violation can only mean the             *
+ * PROBABILITIES are wrong — an unnormalized softmax row, a stale prob     *
+ * buffer, a sample callback that never wrote its weights — never a        *
+ * modelling problem. It runs for every arm and the process exits nonzero. *
+ *                                                                        *
+ * ---------------------------------------------------------------------- *
+ * S IS A PARAMETER, AND THE ENSEMBLE IS THE ASYMMETRY                     *
+ *                                                                        *
+ * Each arm supplies a uq_sample_fn: "give me draw s". The Bayesian arms   *
+ * draw from a posterior, so S is free and the estimates converge as S     *
+ * grows; the comparison is only fair at equal S, hence the parameter.     *
+ *                                                                        *
+ * The deep ensemble CANNOT do this. Its S-th sample is its S-th trained   *
+ * member, so S is capped at E and every extra sample costs a full         *
+ * training run rather than a forward pass. ens_eval() therefore IGNORES   *
+ * a requested S, says so on stdout, and uq_evaluate() prints the S it     *
+ * actually used with the reason. Do not paper over this when reporting:   *
+ * "ensemble at S=5" and "BBB at S=5" cost the same at inference and       *
+ * wildly different amounts to obtain.                                     *
+ *                                                                        *
+ * ---------------------------------------------------------------------- *
+ * WHAT ELSE IS DELIBERATE                                                 *
+ *                                                                        *
+ *   NLPD single   the first draw alone, against the S-draw mixture. For   *
+ *                 the ensemble that is member 0; for a BNN arm it is one  *
+ *                 posterior sample. Same meaning, same column.            *
+ *   ECE           UQ_BINS bins on next-token argmax confidence, ID only.  *
+ *   OOD           uniform-random token ids, seeded 99991. Synthetic, but  *
+ *                 directional: epistemic MUST rise out there, and the     *
+ *                 report warns when it does not.                          *
+ *   split         printed with every number. There is no default that is  *
+ *                 safe to leave unstated in a paper.                      *
+ * ===================================================================== */
+
+// Mirror of ckpt_save. Returns the step count from the header, or -1.
+// The shape fields are checked, not just read: loading a C=768 checkpoint into
+// a C=384 run would otherwise read 44 MB of the wrong tensor and report
+// confident nonsense rather than failing.
+static int ckpt_load(const char *arm, const char *what, float *d_buf,
+                     size_t n, Config cfg, int steps) {
+    char path[512];
+    snprintf(path, sizeof path, "runs/%s_C%d_L%d_%dk_%s.bin",
+             arm, cfg.C, cfg.L, steps / 1000, what);
+    FILE *f = fopen(path, "rb");
+    if (!f) { printf("ckpt: cannot open %s\n", path); return -1; }
+    int hdr[8];
+    if (fread(hdr, sizeof(int), 8, f) != 8) {
+        printf("ckpt: short header in %s\n", path); fclose(f); return -1;
+    }
+    if (hdr[0] != 20240520) {
+        printf("ckpt: bad magic %d in %s\n", hdr[0], path); fclose(f); return -1;
+    }
+    size_t got = (size_t)(unsigned int)hdr[1] | ((size_t)(unsigned int)hdr[7] << 32);
+    if (got != n || hdr[2] != cfg.C || hdr[3] != cfg.L ||
+        hdr[4] != cfg.V || hdr[5] != cfg.NH) {
+        printf("ckpt: shape mismatch in %s\n"
+               "      file n=%zu C=%d L=%d V=%d NH=%d\n"
+               "      run  n=%zu C=%d L=%d V=%d NH=%d\n",
+               path, got, hdr[2], hdr[3], hdr[4], hdr[5],
+               n, cfg.C, cfg.L, cfg.V, cfg.NH);
+        fclose(f); return -1;
+    }
+    float *h = (float *)malloc(n * sizeof(float));
+    if (!h) { printf("ckpt: host alloc failed for %s\n", path); fclose(f); return -1; }
+    if (fread(h, sizeof(float), n, f) != n) {
+        printf("ckpt: short read on %s\n", path); free(h); fclose(f); return -1;
+    }
+    fclose(f);
+    CUDA_CHECK(cudaMemcpy(d_buf, h, n * sizeof(float), cudaMemcpyHostToDevice));
+    free(h);
+    printf("ckpt: loaded %s  (%zu floats, %.0f MB, %d steps)\n",
+           path, n, n * 4 / 1e6, hdr[6]);
+    return hdr[6];
+}
+
+// Token count from a .bin header WITHOUT loading the tokens. Vadam's sigma is
+// 1/sqrt(N*s + lambda) with N = the TRAINING token count, so evaluating a
+// Vadam checkpoint on the val split still needs the train split's N. Reading
+// 1 KB of header beats re-reading 90M tokens to learn one integer.
+static long loader_count(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { printf("cannot open %s\n", path); exit(1); }
+    int header[256];
+    if (fread(header, sizeof(int), 256, f) != 256) {
+        printf("bad header in %s\n", path); exit(1);
+    }
+    fclose(f);
+    if (header[0] != 20240520) { printf("bad magic %d in %s\n", header[0], path); exit(1); }
+    return header[2];
+}
+
+// A typo must not silently become a val-split number wearing a test-split
+// label, so an unknown name exits rather than falling back.
+static const char *uq_split_path(const char *split) {
+    if (strcmp(split, "val")  == 0) return DATA_VAL;
+    if (strcmp(split, "test") == 0) return DATA_TEST;
+    printf("unknown split '%s' — use 'val' or 'test'\n", split);
+    exit(1);
+}
+
+#define UQ_BINS 15
+// Eval draws come from a Philox stream disjoint from every training stream, so
+// a posterior sample at eval is never the exact eps some training step used.
+#define UQ_EVAL_SEED  (20240520ull ^ 0xE7A1E7A1ull)
+
+// "Populate a parameter vector for sample s and return a device pointer to it."
+// Returning a pointer rather than filling a fixed buffer lets the ensemble hand
+// back member s with no copy at all, while the BNN arms fill their scratch w.
+typedef const float *(*uq_sample_fn)(int s, void *ctx);
+
+typedef struct {
+    Config cfg;
+    int    S;                // posterior samples per position
+    int    nbatches;         // eval batches of B*T positions (ID; same for OOD)
+    const char *arm;         // "bbb" / "vadam" / "lowr" / "ens"
+    const char *split;       // printed with every number
+    const char *mix_label;   // what the S-sample mixture is called in the report
+    int    s_fixed_by_arm;   // 1 for the ensemble: S is E, not a choice
+    int    fixed_batch;      // 1 = evaluate whatever is already in d_inp/d_tgt
+} UQSpec;
+
+typedef struct {
+    double nlpd_single, nlpd_mix;      // per position
+    double total, alea, epi;           // per position, ID
+    double epi_ood;                    // per position, OOD
+    double ece;
+    double id_err_max;                 // worst |total-(alea+epi)| over ID and OOD
+    long   npos, npos_ood;
+} UQResult;
+
+// Sums over positions. All math in double — the identity check at 1e-5 is only
+// meaningful if the arithmetic is cleaner than the tolerance.
+typedef struct {
+    double nlpd_mix, nlpd_single;
+    double total, alea, epi;
+    double id_err_max;
+    double bin_conf[UQ_BINS], bin_acc[UQ_BINS]; long bin_n[UQ_BINS];
+    long npos;
+} UQAcc;
+
+// Fold one batch: S prob rows per position -> the accumulator. This is the
+// function that used to be train_ensemble.cu's eval_batch, with the ensemble's
+// E replaced by S. Pass S = E and the arithmetic is identical, term for term
+// and in the same order, which is what keeps the control arm's numbers fixed.
+static void uq_fold_batch(UQAcc *acc, float **probs /*S x BT*V*/, const int *tgt,
+                          int BT, int V, int S, double *pbar /*V scratch*/,
+                          int with_nlpd) {
+    for (int p = 0; p < BT; p++) {
+        // p_bar: the mixture of the S samples, in double
+        for (int y = 0; y < V; y++) pbar[y] = 0.0;
+        for (int s = 0; s < S; s++) {
+            const float *ps = probs[s] + (size_t)p * V;
+            for (int y = 0; y < V; y++) pbar[y] += ps[y];
+        }
+        double h_bar = 0.0;
+        int argmax = 0;
+        for (int y = 0; y < V; y++) {
+            pbar[y] /= S;
+            if (pbar[y] > 0.0) h_bar -= pbar[y] * log(pbar[y]);
+            if (pbar[y] > pbar[argmax]) argmax = y;
+        }
+
+        // aleatoric = mean sample entropy; epistemic = mean KL(p_s || p_bar),
+        // computed DIRECTLY (not as the difference) so the identity check
+        // below actually tests something.
+        double h_mean = 0.0, kl_mean = 0.0;
+        for (int s = 0; s < S; s++) {
+            const float *ps = probs[s] + (size_t)p * V;
+            double h = 0.0, kl = 0.0;
+            for (int y = 0; y < V; y++) {
+                double q = ps[y];
+                if (q > 0.0) {                 // p_bar_y >= q/S > 0, so log is finite
+                    double lq = log(q);
+                    h  -= q * lq;
+                    kl += q * (lq - log(pbar[y]));
+                }
+            }
+            h_mean += h; kl_mean += kl;
+        }
+        h_mean /= S; kl_mean /= S;
+
+        double id_err = fabs(h_bar - (h_mean + kl_mean));
+        if (id_err > acc->id_err_max) acc->id_err_max = id_err;
+
+        acc->total += h_bar; acc->alea += h_mean; acc->epi += kl_mean;
+
+        if (with_nlpd) {
+            int y = tgt[p];
+            acc->nlpd_mix    -= log(fmax(pbar[y], 1e-30));
+            acc->nlpd_single -= log(fmax((double)probs[0][(size_t)p * V + y], 1e-30));
+            int b = (int)(pbar[argmax] * (double)UQ_BINS);
+            if (b > UQ_BINS - 1) b = UQ_BINS - 1;
+            acc->bin_conf[b] += pbar[argmax];
+            acc->bin_acc[b]  += (argmax == y) ? 1.0 : 0.0;
+            acc->bin_n[b]++;
+        }
+        acc->npos++;
+    }
+}
+
+// A GPU-free check of the decomposition itself, on three cases whose answers
+// are known on paper. Every arm's eval runs it first, so the shared math is
+// gated before an hour of forward passes rather than after. Costs microseconds.
+static int uq_selftest(void) {
+    const int V = 2;
+    double pbar[2];
+    float pa[2] = { 1.00f, 0.00f };      // one-hot
+    float pb[2] = { 0.00f, 1.00f };      // the opposite one-hot
+    float pc[2] = { 0.25f, 0.75f };      // exactly representable in float
+    float *one[1]      = { pc };
+    float *same[2]     = { pc, pc };
+    float *disjoint[2] = { pa, pb };
+    const double L2 = log(2.0);
+    const double Hc = -(0.25 * log(0.25) + 0.75 * log(0.75));
+    const double TOL = 1e-12;            // exact cases; 1 ulp is ~1e-16
+    UQAcc acc; int fails = 0;
+
+    // S=1: one sample disagrees with nothing, so epistemic is exactly zero
+    // and total collapses onto aleatoric.
+    memset(&acc, 0, sizeof acc);
+    uq_fold_batch(&acc, one, NULL, 1, V, 1, pbar, 0);
+    if (fabs(acc.epi) > TOL || fabs(acc.alea - Hc) > TOL || fabs(acc.total - Hc) > TOL) {
+        printf("uq_selftest: S=1 case failed (total %.17g alea %.17g epi %.17g)\n",
+               acc.total, acc.alea, acc.epi); fails++;
+    }
+    // Two IDENTICAL samples: still nothing to disagree about.
+    memset(&acc, 0, sizeof acc);
+    uq_fold_batch(&acc, same, NULL, 1, V, 2, pbar, 0);
+    if (fabs(acc.epi) > TOL || fabs(acc.total - Hc) > TOL) {
+        printf("uq_selftest: identical-samples case failed (total %.17g epi %.17g)\n",
+               acc.total, acc.epi); fails++;
+    }
+    // Maximal disagreement: two disjoint one-hots. Each sample is certain
+    // (alea = 0) and the mixture is maximally uncertain (total = epi = log 2).
+    memset(&acc, 0, sizeof acc);
+    uq_fold_batch(&acc, disjoint, NULL, 1, V, 2, pbar, 0);
+    if (fabs(acc.alea) > TOL || fabs(acc.epi - L2) > TOL || fabs(acc.total - L2) > TOL) {
+        printf("uq_selftest: disjoint-one-hot case failed (total %.17g alea %.17g epi %.17g)\n",
+               acc.total, acc.alea, acc.epi); fails++;
+    }
+    if (acc.id_err_max > TOL) {
+        printf("uq_selftest: identity error %.2e exceeds %.0e\n", acc.id_err_max, TOL);
+        fails++;
+    }
+    if (fails) printf("uq_selftest: %d CASE(S) FAILED — the shared decomposition is wrong\n", fails);
+    return fails;
+}
+
+/* The driver. Device buffers come from the caller because every arm already
+   owns them; only the host prob rows are allocated here (S x B*T*V floats —
+   27 KB per sample at V=27, so S is bounded by patience, not memory).
+   Returns 0, or 1 if the identity assertion fired. */
+static int uq_evaluate(const UQSpec *spec, uq_sample_fn sample_fn, void *ctx,
+                       Loader *ld, float *d_acts, int *d_inp, int *d_tgt,
+                       int *h_inp, int *h_tgt, float *h_losses, UQResult *out) {
+    Config cfg = spec->cfg;
+    ActOff a = act_offsets(cfg);
+    int BT = cfg.B * cfg.T, V = cfg.V, S = spec->S;
+
+    printf("eval: arm %-5s | split %s | S=%d%s | %d batches x %d tokens"
+           " = %d ID positions (+%d OOD)\n",
+           spec->arm, spec->split, S,
+           spec->s_fixed_by_arm ? " (FIXED by the arm: S = trained members)" : "",
+           spec->nbatches, BT, spec->nbatches * BT, spec->nbatches * BT);
+
+    float **h_probs = (float **)malloc((size_t)S * sizeof(float *));
+    for (int s = 0; s < S; s++)
+        h_probs[s] = (float *)malloc((size_t)BT * V * sizeof(float));
+    double *pbar = (double *)malloc((size_t)V * sizeof(double));
+    UQAcc id; memset(&id, 0, sizeof id);
+    UQAcc ood; memset(&ood, 0, sizeof ood);
+
+    // ---- in-distribution: held-out text -----------------------------------
+    for (int b = 0; b < spec->nbatches; b++) {
+        if (!spec->fixed_batch) {
+            loader_next(ld, h_inp, h_tgt, BT);
+            CUDA_CHECK(cudaMemcpy(d_inp, h_inp, BT * sizeof(int), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_tgt, h_tgt, BT * sizeof(int), cudaMemcpyHostToDevice));
+        }
+        for (int s = 0; s < S; s++) {
+            const float *w = sample_fn(s, ctx);
+            gpt2_forward(d_acts, w, d_inp, d_tgt, cfg, h_losses);
+            CUDA_CHECK(cudaMemcpy(h_probs[s], d_acts + a.prb,
+                                  (size_t)BT * V * sizeof(float), cudaMemcpyDeviceToHost));
+        }
+        uq_fold_batch(&id, h_probs, h_tgt, BT, V, S, pbar, 1);
+    }
+
+    // ---- OOD: uniform-random token ids ------------------------------------
+    // Not another text domain — a direction. Sample disagreement must RISE out
+    // here or the arm is not capturing model uncertainty at all.
+    srand(99991);
+    for (int b = 0; b < spec->nbatches; b++) {
+        for (int i = 0; i < BT; i++) { h_inp[i] = rand() % V; h_tgt[i] = rand() % V; }
+        CUDA_CHECK(cudaMemcpy(d_inp, h_inp, BT * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_tgt, h_tgt, BT * sizeof(int), cudaMemcpyHostToDevice));
+        for (int s = 0; s < S; s++) {
+            const float *w = sample_fn(s, ctx);
+            gpt2_forward(d_acts, w, d_inp, d_tgt, cfg, h_losses);
+            CUDA_CHECK(cudaMemcpy(h_probs[s], d_acts + a.prb,
+                                  (size_t)BT * V * sizeof(float), cudaMemcpyDeviceToHost));
+        }
+        uq_fold_batch(&ood, h_probs, h_tgt, BT, V, S, pbar, 0);
+    }
+
+    double np = (double)id.npos;
+    double ece = 0.0;
+    for (int b = 0; b < UQ_BINS; b++)
+        if (id.bin_n[b]) ece += fabs(id.bin_acc[b] - id.bin_conf[b]) / np;
+
+    out->nlpd_single = id.nlpd_single / np;
+    out->nlpd_mix    = id.nlpd_mix    / np;
+    out->total       = id.total / np;
+    out->alea        = id.alea  / np;
+    out->epi         = id.epi   / np;
+    out->epi_ood     = ood.npos ? ood.epi / (double)ood.npos : 0.0;
+    out->ece         = ece;
+    out->id_err_max  = fmax(id.id_err_max, ood.id_err_max);
+    out->npos        = id.npos;
+    out->npos_ood    = ood.npos;
+
+    for (int s = 0; s < S; s++) free(h_probs[s]);
+    free(h_probs); free(pbar);
+
+    // THE gate. See the header: this is exact algebra, so a violation means the
+    // probabilities are wrong, not the model.
+    if (out->id_err_max > 1e-5) {
+        fprintf(stderr, "IDENTITY VIOLATION: |total-(alea+epi)| = %.2e (tol 1e-5)\n",
+                out->id_err_max);
+        return 1;
+    }
+    return 0;
+}
+
+// Two "summary:" lines, the format scorecard.c already parses and passes
+// through. mix_label is what the S-sample mixture is called, so the control
+// arm keeps saying "ensemble" and its output is unchanged.
+static void uq_report(const UQSpec *spec, const UQResult *r) {
+    printf("summary: NLPD single %.4f -> %s %.4f | ECE(%d) %.4f | identity_err %.1e\n",
+           r->nlpd_single, spec->mix_label, r->nlpd_mix, UQ_BINS, r->ece, r->id_err_max);
+    printf("summary: uncertainty (nats)  ID: total %.3f = alea %.3f + epi %.4f   OOD: epi %.4f  %s\n",
+           r->total, r->alea, r->epi, r->epi_ood,
+           r->epi_ood > r->epi ? "(OOD > ID, as required)" : "(WARN: OOD <= ID!)");
+}
+
+/* The eval CLI, identical for every arm, so the four are invoked the same way
+   and an unequal S cannot creep in by accident:
+
+       <binary> eval [steps] [S] [batches] [split]
+
+   steps    which checkpoint to load — runs/<arm>_C<C>_L<L>_<steps/1000>k_*.bin
+   S        posterior samples per position (ensemble: ignored, S = E)
+   batches  eval batches, B*T positions each, ID and again for OOD
+   split    "val" or "test". Never inferred, always printed.                */
+typedef struct { int steps, S, nbatches; const char *split; } UQArgs;
+
+static UQArgs uq_parse_args(int argc, char **argv) {
+    UQArgs u; u.steps = 100000; u.S = 8; u.nbatches = 64; u.split = "val";
+    if (argc > 2) u.steps    = atoi(argv[2]);
+    if (argc > 3) u.S        = atoi(argv[3]);
+    if (argc > 4) u.nbatches = atoi(argv[4]);
+    if (argc > 5) u.split    = argv[5];
+    if (u.S < 1)        u.S = 1;
+    if (u.nbatches < 1) u.nbatches = 1;
+    return u;
 }
 
 #endif  // GPT2_KERNELS_CUH
