@@ -50,6 +50,32 @@ that is the intended behaviour, not a failure.
 To soften the placeholders for a camera-ready, redefine `\NA` and `\todo`
 in `preamble.tex`. Never by editing a generated table.
 
+## Regenerating the figures
+
+```
+make -C paper figures                  # what the build already does for you
+python3 paper/tables/make_figures.py --selftest   # generator self-check
+```
+
+`make_figures.py` is a sibling of `make_tables.py` under the same rule, and
+reuses its log parsers rather than owning a second copy of the stdout
+format. It reads `runs/sweep/*.log` (an S sweep, one eval log per arm and
+*S*) plus `runs/*.log` for the ensemble's structural *S*, and writes
+`tables/generated/fig-s-convergence.{pdf,tex}`.
+
+The section `\input`s the **`.tex`**, never the PDF directly: with no
+`runs/` that file holds a red `\todo` instead of an `\includegraphics`, so
+a checkout without measurements still builds rather than failing on a
+missing image. Plotting needs `matplotlib`; the placeholder path does not
+import it, so CI needs nothing installed.
+
+Two invariants the generator enforces, beyond the shared one:
+
+- **Epistemic at *S*=1 must be exactly zero** — one sample disagrees with
+  nothing. If it is not, the generator refuses to plot and exits nonzero.
+- A figure is **deleted, not kept**, when its data disappears, so a stale
+  plot can never outlive the measurement behind it.
+
 ## Swapping in a venue template
 
 The preamble is deliberately class-agnostic, so the swap is:

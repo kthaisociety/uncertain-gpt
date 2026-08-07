@@ -11,22 +11,32 @@ DOC      := main
 PYTHON   := python3
 LATEXMK  := $(shell command -v latexmk 2>/dev/null)
 TABLEGEN := tables/make_tables.py
+FIGGEN   := tables/make_figures.py
 TABLES   := tables/generated/tab-cost.tex \
             tables/generated/tab-quality.tex \
             tables/generated/tab-uncertainty.tex
+FIGURES  := tables/generated/fig-s-convergence.tex
 
-.PHONY: all pdf tables check clean distclean
+.PHONY: all pdf tables figures check clean distclean
 all: pdf
 
 tables:
 	$(PYTHON) $(TABLEGEN)
 
-# .PHONY tables would force a rebuild anyway; this rule exists so the PDF
-# has a real dependency on the generated files.
+# Needs matplotlib, but only when there is sweep data to plot: with no
+# runs/ (a fresh checkout, CI) the generator emits the \todo placeholder
+# without importing it, so the paper still builds with nothing installed.
+figures:
+	$(PYTHON) $(FIGGEN)
+
+# .PHONY tables/figures would force a rebuild anyway; these rules exist so
+# the PDF has a real dependency on the generated files.
 $(TABLES): tables
 	@:
+$(FIGURES): figures
+	@:
 
-pdf: $(TABLES)
+pdf: $(TABLES) $(FIGURES)
 ifdef LATEXMK
 	$(LATEXMK) -pdf -halt-on-error -interaction=nonstopmode $(DOC).tex
 else
@@ -36,9 +46,10 @@ else
 	pdflatex -halt-on-error -interaction=nonstopmode $(DOC).tex
 endif
 
-# The generator's self-check. No GPU, no LaTeX.
+# The generators' self-checks. No GPU, no LaTeX.
 check:
 	$(PYTHON) $(TABLEGEN) --selftest
+	$(PYTHON) $(FIGGEN) --selftest
 
 clean:
 ifdef LATEXMK
