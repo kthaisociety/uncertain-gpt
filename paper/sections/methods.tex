@@ -5,29 +5,156 @@
 % is held fixed (architecture, data, forward and backward pass, kernels,
 % RNG discipline) so each subsection below only has to say how weights are
 % sampled and how they are updated.
-\todo{shared setup: what is identical across all four arms}
+
+The four arms share one implementation of the network. Kernels, buffer
+layout, forward pass, backward pass, dataloader, checkpoint format, and the
+evaluation harness live in a single header; each arm's own source file holds
+its optimiser and nothing else. A fix to the network lands in all four arms
+in one edit, and the buffer layout is computed in one place, so an arm cannot
+quietly disagree with another about where a tensor is.
+
+Held fixed across arms: the architecture and parameter layout, the forward
+and backward kernels including the cuBLAS calls, the dataloader and the order
+it emits batches in, the AdamW constants of Section~\ref{sec:setup}, fp32
+precision, and the RNG discipline --- perturbations are a pure function of
+(seed, step, index), regenerated in the backward pass instead of stored, and
+evaluation draws from a stream no training step consumed.
+
+Two things vary: how an arm produces a weight vector for a step, and how it
+turns the gradient with respect to that vector into a parameter update. The
+subsections below say only that. Everything a subsection does not mention is
+the shared network.
 
 \subsection{Bayes-by-Backprop}
 \label{sec:m:bbb}
 % Mean-field Gaussian posterior, reparameterised sample per step, ELBO with
 % the KL weight fixed by the data (1/N), not tuned.
-\todo{BBB}
+
+A fully factorised Gaussian posterior over every parameter, with both moments
+free. Each parameter carries a mean $\mu_i$ and an unconstrained
+$\rho_i$, and a step draws
+\begin{equation}
+  w_i = \mu_i + \mathrm{softplus}(\rho_i)\,\varepsilon_i ,
+  \qquad \varepsilon \sim \mathcal{N}(0, I) ,
+\end{equation}
+one draw shared by the whole batch, reparameterised so that the gradient
+flows to both moments \citep{kingma2014autoencoding,blundell2015weight}. The
+softplus keeps the standard deviation positive and compresses its update:
+AdamW's step is about the learning rate whatever the gradient's magnitude, so
+an unconstrained standard deviation initialised near $10^{-3}$ would move by
+its own size every step. The prior is a zero-mean Gaussian of standard
+deviation $0.1$, entering through a closed-form KL gradient rather than a
+sampled estimate.
+
+The objective is the ELBO, $\mathbb{E}_q[\mathrm{NLL}] + \mathrm{KL}(q\|p)/N$.
+The $1/N$ is not a tuning knob. The KL is a per-dataset quantity while the
+reported NLL is a per-token mean, so $N$ is the training token count and the
+weight is read off the loader at startup. Fixing this rather than tuning it
+mattered: a stale hand-set value carried over from a different corpus cost
+about a nat of NLL and made the Bayesian arms look categorically worse than
+they are.
+
+This is the arm with the largest fixed footprint. It needs ten
+parameter-sized buffers where a deterministic model needs four --- $\mu$ and
+$\rho$, an AdamW moment pair for each, the sampled weights and their
+gradient, and an accumulator for each moment's gradient --- and it runs two
+AdamW passes per step. Regenerating $\varepsilon$ from the index removes an
+eleventh buffer and its traffic while changing no arithmetic; the one-batch
+overfit test reaches the same loss either way.
 
 \subsection{Vadam}
 \label{sec:m:vadam}
 % Variational online Newton read as a perturbation of Adam: the second
 % moment doubles as the posterior precision, so the posterior is (almost)
 % free. Note where N enters the scale.
+%
+% DELIBERATELY LEFT PENDING. This arm's trained checkpoint is under
+% investigation; describing the implementation before that verdict risks
+% documenting behaviour that is about to change. Write this subsection once
+% the investigation closes.
 \todo{Vadam}
 
 \subsection{Low-rank plus diagonal covariance}
 \label{sec:m:lowrank}
 % Posterior covariance as a rank-r factor plus a diagonal: what the extra
 % rank is meant to buy, and what it costs in memory and per-step time.
-\todo{low-rank + diagonal}
+
+Mean-field assumes every weight is independent of every other. This arm buys
+back a limited amount of correlation with a covariance of the form
+\begin{equation}
+  \Sigma = A A^{\top} + \mathrm{diag}(d^{\,2}) ,
+  \qquad A \in \mathbb{R}^{P \times r},\; d \in \mathbb{R}^{P},\; r = 8 .
+\end{equation}
+$\Sigma$ is $P \times P$ and is never formed. Sampling uses the factors
+directly,
+\begin{equation}
+  w_i = \mu_i + \sum_{k<r} A_{ik} z_k + d_i \varepsilon_i ,
+\end{equation}
+with one $z \sim \mathcal{N}(0, I_r)$ drawn per weight matrix per forward
+pass and shared by all $P$ of its weights --- that shared draw is what
+couples them --- and $\varepsilon$ drawn per weight from the index-keyed
+Philox stream.
+
+$d = \mathrm{softplus}(\rho_d)$, for the same reason the mean-field arm uses
+softplus. $A$ is signed, so softplus cannot bound it, and it needs a separate
+learning rate instead: $10^{-5}$ for the variance group against $10^{-4}$ for
+the means. One rate cannot serve parameters living at $2\times10^{-2}$ and
+$10^{-4}$ at once when the optimiser's step is scale-free.
+
+The prior is $\mathcal{N}(0, I/\lambda)$ with $\lambda = 100$, matching the
+mean-field arm's prior standard deviation of $0.1$. Its KL is evaluated with
+two identities so that $\Sigma$ stays factored,
+\begin{equation}
+  \mathrm{tr}(\Sigma) = \|A\|_F^2 + \|d\|^2 , \qquad
+  \log\det(\Sigma) = \log\det(M) + \textstyle\sum_i \log d_i^2 , \qquad
+  M = I_r + A^{\top} D^{-1} A ,
+\end{equation}
+which turns a $P \times P$ determinant into an $r \times r$ one. The
+gradients follow from the Woodbury identity and reduce to the mean-field
+gradients at $A = 0$, where the stationary point of the diagonal is
+$1/\sqrt{\lambda}$, the prior standard deviation.
+
+The posterior covers the four GEMM weight matrices in each block ---
+$W_{qkv}$, $W_{proj}$, $W_{fc}$, $W_{fc2}$, or $10{,}616{,}832$ of the model's
+$11{,}061{,}531$ parameters. Embeddings, LayerNorm gains and biases, and all
+biases stay deterministic, and each matrix has its own $A$, $d$ and $z$, so
+there is no correlation across matrices or across blocks.
+
+Sampling is a separate kernel, not a fused GEMM prologue. The network calls
+cuBLAS, so there is no GEMM of ours to fuse into, and fusing only this arm
+would make the comparison measure kernel engineering instead of posterior
+structure. Fusion, if done, belongs in every arm at once.
+
+The rank is a compile-time parameter so the length-$r$ loops unroll into
+registers, which means a checkpoint has to be evaluated at the rank it was
+trained at. The checkpoint loader's element-count check catches a mismatch
+rather than reading the wrong tensor.
 
 \subsection{Deep ensemble (control)}
 \label{sec:m:ensemble}
 % The control arm: no posterior machinery at all, E independently trained
 % members. Say why it is the reference the other three are measured against.
-\todo{deep ensemble}
+
+$E = 5$ independently trained deterministic models
+\citep{lakshminarayanan2017simple}, differing only in the seed that
+initialises their weights. The network has no dropout and the dataloader is
+sequential, so initialisation is the only source of diversity; there is no
+bagging, which would shrink each member's effective training set.
+Architecture, data order, optimiser, learning rate, step count, batch size
+and precision are identical across members and identical to the other three
+arms. At inference the members' probabilities are averaged, never their
+logits.
+
+This arm introduces no kernels at all. Members train through the shared
+forward and backward pass and the shared AdamW, and its evaluation callback
+returns a pointer to member $s$ without sampling anything. That is exactly
+why it is the reference: it is the same network with the Bayesian machinery
+deleted, so every buffer and every kernel pass the other three add is
+attributable to their posterior and nothing else.
+
+At evaluation the advantage reverses. A Bayesian arm buys its $(S+1)$-th
+sample for one forward pass; this arm's $S$ is capped at the number of
+members it paid to train, and raising it costs another full training run.
+Evaluating at $S = E$ costs every arm the same forward passes. Getting there
+does not, and the harness prints the $S$ it used rather than quietly
+evaluating the arms at different sample counts.

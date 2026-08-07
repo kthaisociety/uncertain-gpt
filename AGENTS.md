@@ -86,6 +86,11 @@ against the wrapper requires.
   `overfit` runs diverge from themselves run to run — a last-bit difference
   amplifies in a steeply falling loss — so compare final nll and shape, not
   digits. Normal-mode runs ARE reproducible and are the regression check to use.
+- **Some `.cu` file headers still quote C=768 numbers.** `train_bnn_lowrank.cu`
+  says "7,077,888 params, 8.3% of 85,120,849"; `train_bnn_gpu.cu` says
+  "340 MB/buffer". At the current `Config` (C=384, L=6) it is 10,616,832 of
+  11,061,531 (96%) and 44 MB/buffer. Recompute from the `Config` literal and
+  `param_offsets` — never copy a count out of a header comment.
 - `scorecard.c` parses stdout by format string (`step %d | nll %f | ...` and
   `summary:` lines, first 3 only). Changing those formats breaks the scorecard.
 - `paper/tables/make_tables.py` parses the SAME two formats plus the `eval:`

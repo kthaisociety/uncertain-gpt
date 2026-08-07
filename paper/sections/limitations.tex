@@ -5,4 +5,85 @@
 % Which code paths carry a correctness argument and which do not; which
 % comparisons are confounded (e.g. an arm's injected noise scale versus the
 % posterior itself) and what would be needed to separate them.
-\todo{limitations}
+
+\paragraph{Scale is a choice, and it is small.}
+$11{,}061{,}531$ parameters on a $6$\,GB card. The scale was picked so that
+all four arms fit at once: the low-rank arm and the five-member ensemble are
+the memory-hungry ones, and a model large enough to fill the card would have
+priced them out and destroyed the comparison. Nothing here should be read as
+a claim about billion-parameter models. What transfers is the ratio between
+arms on one implementation, not the absolute cost. The configuration carries
+two smaller caveats. The character-level vocabulary of $27$ keeps the token
+embedding negligible, which is deliberate, but it means no result here says
+anything about a posterior over a large embedding table. And the position
+embedding is sized for a $1024$-token context while training runs at $64$, so
+about $3\%$ of the parameters never see a data gradient and are held at the
+prior by the KL term alone, while still costing posterior state in three of
+the four arms.
+
+\paragraph{Nothing is converged.}
+$100{,}000$ steps at $256$ tokens per step is $25.6$M tokens against a $90$M
+token training split --- $28\%$ of one epoch. Every number is what a method
+does at a fixed step budget, not what it converges to, and the ranking
+between arms is free to change with more steps. The budget is equal across
+arms, which is what the comparison needs; it is not sufficient for any arm.
+
+\paragraph{Step times are lower bounds, not controlled measurements.}
+The runs span two sessions on a card with a cooling fault. It throttled to
+$46$--$51$\,W at $87$--$89$\,\textdegree C against a board budget of
+$65$--$80$\,W, and the low-rank arm's step time drifted from $52$ to $65$\,ms
+within a single run with no change in the work being done. A reported figure
+is therefore a lower bound on what that arm actually cost per step during its
+own run, and the two sessions did not throttle alike, so the arms were not
+clocked under matched conditions. Read the step times as orders of magnitude
+between arms. A gap of a few milliseconds is not a result. What a healthy
+card of this class would deliver is not measured here at all.
+
+\paragraph{$n = 1$, and the noise floor is unknown.}
+One training run per arm. No error bars, no seed sweep. Worse, the runs are
+not reproducible even in principle: three backward kernels ---
+\texttt{encoder\_backward}, \texttt{layernorm\_backward} and
+\texttt{attention\_backward} --- accumulate gradients with \texttt{atomicAdd},
+so the order of floating-point additions varies between runs. Two identical
+invocations diverge. Nothing in this paper measures how large that divergence
+grows over $100{,}000$ steps, so we cannot say which differences between arms
+exceed it. Small gaps should be treated as unresolved.
+
+\paragraph{The off-distribution stream is synthetic.}
+Uniform-random token ids, not shifted text. It is a direction check: sample
+disagreement has to rise where the input carries no structure, and an arm
+that fails it is not capturing model uncertainty at all. It is not a
+distribution shift benchmark, and it supports no comparison with the
+shift literature \citep{ovadia2019trust}. A second text domain would be the
+minimum needed for that.
+
+\paragraph{Noise scale and posterior quality are confounded.}
+Loss currently tracks the injected noise scale monotonically across arms, so
+an arm that samples less aggressively looks better on predictive metrics for
+a reason that has nothing to do with the quality of its posterior. As
+reported, the experiment cannot separate the two. Separating them needs a
+sweep over the noise scale within each arm and a comparison of curves rather
+than of single points; that runs against saved checkpoints and needs no
+retraining.
+
+\paragraph{Not every code path carries a correctness argument.}
+Each kernel was validated against the CPU reference implementation, but that
+reference is a single-block model, so the multi-block loop at $L = 6$ has no
+independent check. Its only evidence is behavioural: the one-batch overfit
+test still drives the loss to $0.0070$ at $L = 6$. A finite-difference
+gradient check on a tiny multi-block configuration would close the gap and
+has not been run.
+% Vadam's optimiser kernels have their own open validation question. It is
+% under investigation; state it here once that closes, alongside the
+% Vadam subsection in Section~\ref{sec:m:vadam}.
+
+\paragraph{The arms are not identical in what they cover.}
+The low-rank arm places its posterior over the four GEMM weight matrices per
+block and leaves embeddings, LayerNorm parameters and biases deterministic;
+the other three are Bayesian over every parameter. At this configuration
+that is $96\%$ of the model rather than all of it, so the gap is small, but
+it is a gap and it flatters the low-rank arm's cost. Relatedly, the ensemble
+evaluates at $S = E = 5$ by construction while the Bayesian arms evaluate at
+whatever $S$ is requested; a mixture metric compared across arms at different
+$S$ compares different sample counts, which is why $S$ is printed with every
+number.
