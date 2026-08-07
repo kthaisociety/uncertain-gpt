@@ -61,6 +61,9 @@ venue-template swap. One rule holds everywhere: **no number is ever typed
 into the paper.** Cost and quality tables are generated from `runs/` into
 `paper/tables/generated/` (gitignored) and a cell with no measurement
 behind it renders as a loud red `TODO`, never as a plausible value.
+`paper/main.pdf` is tracked and rebuilt by `.github/workflows/paper.yml` so
+GitHub can render it; CI has no `runs/`, so **the committed PDF's tables are
+all `TODO` by design** — trust a local build for numbers.
 
 ## Maintaining this file
 

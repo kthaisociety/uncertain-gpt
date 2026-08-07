@@ -1,0 +1,4 @@
+# The repo root ignores everything and whitelists authored file types
+# (see ../.gitignore). Workflow YAML is let back in HERE rather than by
+# widening that list, since it exists nowhere else.
+!*.yml

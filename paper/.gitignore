@@ -12,6 +12,10 @@
 # measurement it came from.
 tables/generated/
 *.pdf
+# ...except the rendered paper itself, which is committed by the `paper`
+# workflow so GitHub can display it in-browser. Its tables are placeholders;
+# see README.md.
+!main.pdf
 *.aux
 *.bbl
 *.blg

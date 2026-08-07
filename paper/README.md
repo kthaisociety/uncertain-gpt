@@ -17,6 +17,11 @@ removes build artefacts, `distclean` also removes the generated tables.
 
 Nothing in this directory touches the GPU.
 
+The committed [`main.pdf`](main.pdf) is built by CI
+(`.github/workflows/paper.yml`), which has no `runs/`, so **every generated
+table cell in it is a red `TODO` placeholder**. For real numbers, build
+locally with `runs/` present — that PDF is the one to trust.
+
 ## Regenerating the tables
 
 ```
