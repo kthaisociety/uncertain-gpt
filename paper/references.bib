@@ -1,0 +1,324 @@
+% =====================================================================
+%  references.bib — uncertain-gpt
+%
+%  Every entry below was checked against a primary source (PMLR, the
+%  NeurIPS proceedings, dblp, OpenReview, or the artefact itself) rather
+%  than reconstructed from memory. Add entries the same way: a wrong year
+%  or a mangled author list is worse than a missing citation.
+% =====================================================================
+
+% ---------------------------------------------------------------------
+%  Variational Bayesian neural networks
+% ---------------------------------------------------------------------
+
+@inproceedings{hinton1993mdl,
+  author    = {Geoffrey E. Hinton and Drew van Camp},
+  title     = {Keeping the Neural Networks Simple by Minimizing the
+               Description Length of the Weights},
+  booktitle = {Proceedings of the Sixth Annual {ACM} Conference on
+               Computational Learning Theory ({COLT})},
+  pages     = {5--13},
+  publisher = {{ACM}},
+  year      = {1993},
+  doi       = {10.1145/168304.168306}
+}
+
+@inproceedings{graves2011practical,
+  author    = {Alex Graves},
+  title     = {Practical Variational Inference for Neural Networks},
+  booktitle = {Advances in Neural Information Processing Systems 24
+               ({NIPS})},
+  pages     = {2348--2356},
+  year      = {2011},
+  url       = {https://proceedings.neurips.cc/paper/2011/hash/7eb3c8be3d411e8ebfab08eba5f49632-Abstract.html}
+}
+
+@inproceedings{blundell2015weight,
+  author    = {Charles Blundell and Julien Cornebise and
+               Koray Kavukcuoglu and Daan Wierstra},
+  title     = {Weight Uncertainty in Neural Network},
+  booktitle = {Proceedings of the 32nd International Conference on
+               Machine Learning ({ICML})},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {37},
+  pages     = {1613--1622},
+  publisher = {PMLR},
+  year      = {2015},
+  url       = {https://proceedings.mlr.press/v37/blundell15.html}
+}
+
+@inproceedings{kingma2014autoencoding,
+  author    = {Diederik P. Kingma and Max Welling},
+  title     = {Auto-Encoding Variational Bayes},
+  booktitle = {2nd International Conference on Learning Representations
+               ({ICLR})},
+  year      = {2014},
+  url       = {http://arxiv.org/abs/1312.6114}
+}
+
+@inproceedings{wen2018flipout,
+  author    = {Yeming Wen and Paul Vicol and Jimmy Ba and Dustin Tran and
+               Roger B. Grosse},
+  title     = {Flipout: Efficient Pseudo-Independent Weight Perturbations
+               on Mini-Batches},
+  booktitle = {6th International Conference on Learning Representations
+               ({ICLR})},
+  publisher = {OpenReview.net},
+  year      = {2018},
+  url       = {https://openreview.net/forum?id=rJNpifWAb}
+}
+
+% ---------------------------------------------------------------------
+%  Natural-gradient / optimiser-shaped variational inference
+% ---------------------------------------------------------------------
+
+@inproceedings{khan2018vadam,
+  author    = {Mohammad Emtiyaz Khan and Didrik Nielsen and
+               Voot Tangkaratt and Wu Lin and Yarin Gal and
+               Akash Srivastava},
+  title     = {Fast and Scalable {B}ayesian Deep Learning by
+               Weight-Perturbation in {A}dam},
+  booktitle = {Proceedings of the 35th International Conference on
+               Machine Learning ({ICML})},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {80},
+  pages     = {2611--2620},
+  publisher = {PMLR},
+  year      = {2018},
+  url       = {https://proceedings.mlr.press/v80/khan18a.html}
+}
+
+@inproceedings{osawa2019practical,
+  author    = {Kazuki Osawa and Siddharth Swaroop and
+               Mohammad Emtiyaz Khan and Anirudh Jain and
+               Runa Eschenhagen and Richard E. Turner and Rio Yokota},
+  title     = {Practical Deep Learning with {B}ayesian Principles},
+  booktitle = {Advances in Neural Information Processing Systems 32
+               ({NeurIPS})},
+  pages     = {4289--4301},
+  year      = {2019},
+  url       = {https://proceedings.neurips.cc/paper/2019/hash/b53477c2821c1bf0da5d40e57b870d35-Abstract.html}
+}
+
+@inproceedings{shen2024ivon,
+  author    = {Yuesong Shen and Nico Daheim and Bai Cong and
+               Peter Nickl and Gian Maria Marconi and Clement Bazan and
+               Rio Yokota and Iryna Gurevych and Daniel Cremers and
+               Mohammad Emtiyaz Khan and Thomas M{\"{o}}llenhoff},
+  title     = {Variational Learning is Effective for Large Deep Networks},
+  booktitle = {Proceedings of the 41st International Conference on
+               Machine Learning ({ICML})},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {235},
+  pages     = {44665--44686},
+  publisher = {PMLR},
+  year      = {2024},
+  url       = {https://proceedings.mlr.press/v235/shen24b.html}
+}
+
+% ---------------------------------------------------------------------
+%  Post-hoc and covariance-structured posteriors
+%  (the closest existing work to the low-rank arm)
+% ---------------------------------------------------------------------
+
+@inproceedings{ritter2018scalable,
+  author    = {Hippolyt Ritter and Aleksandar Botev and David Barber},
+  title     = {A Scalable {L}aplace Approximation for Neural Networks},
+  booktitle = {6th International Conference on Learning Representations
+               ({ICLR})},
+  publisher = {OpenReview.net},
+  year      = {2018},
+  url       = {https://openreview.net/forum?id=Skdvd2xAZ}
+}
+
+@inproceedings{daxberger2021laplace,
+  author    = {Erik A. Daxberger and Agustinus Kristiadi and
+               Alexander Immer and Runa Eschenhagen and Matthias Bauer
+               and Philipp Hennig},
+  title     = {{L}aplace Redux --- Effortless {B}ayesian Deep Learning},
+  booktitle = {Advances in Neural Information Processing Systems 34
+               ({NeurIPS})},
+  pages     = {20089--20103},
+  year      = {2021},
+  url       = {https://proceedings.neurips.cc/paper/2021/hash/a7c9585703d275249f30a088cebba0ad-Abstract.html}
+}
+
+@inproceedings{maddox2019swag,
+  author    = {Wesley J. Maddox and Pavel Izmailov and Timur Garipov and
+               Dmitry P. Vetrov and Andrew Gordon Wilson},
+  title     = {A Simple Baseline for {B}ayesian Uncertainty in Deep
+               Learning},
+  booktitle = {Advances in Neural Information Processing Systems 32
+               ({NeurIPS})},
+  pages     = {13132--13143},
+  year      = {2019},
+  url       = {https://proceedings.neurips.cc/paper/2019/hash/118921efba23fc329e6560b27861f0c2-Abstract.html}
+}
+
+% ---------------------------------------------------------------------
+%  Non-Bayesian and approximate baselines
+% ---------------------------------------------------------------------
+
+@inproceedings{lakshminarayanan2017simple,
+  author    = {Balaji Lakshminarayanan and Alexander Pritzel and
+               Charles Blundell},
+  title     = {Simple and Scalable Predictive Uncertainty Estimation
+               using Deep Ensembles},
+  booktitle = {Advances in Neural Information Processing Systems 30
+               ({NIPS})},
+  pages     = {6402--6413},
+  year      = {2017},
+  url       = {https://proceedings.neurips.cc/paper/2017/hash/9ef2ed4b7fd2c810847ffa5fa85bce38-Abstract.html}
+}
+
+@inproceedings{gal2016dropout,
+  author    = {Yarin Gal and Zoubin Ghahramani},
+  title     = {Dropout as a {B}ayesian Approximation: Representing Model
+               Uncertainty in Deep Learning},
+  booktitle = {Proceedings of the 33rd International Conference on
+               Machine Learning ({ICML})},
+  series    = {{JMLR} Workshop and Conference Proceedings},
+  volume    = {48},
+  pages     = {1050--1059},
+  publisher = {JMLR.org},
+  year      = {2016},
+  url       = {http://proceedings.mlr.press/v48/gal16.html}
+}
+
+% ---------------------------------------------------------------------
+%  Evaluating uncertainty
+% ---------------------------------------------------------------------
+
+@inproceedings{guo2017calibration,
+  author    = {Chuan Guo and Geoff Pleiss and Yu Sun and
+               Kilian Q. Weinberger},
+  title     = {On Calibration of Modern Neural Networks},
+  booktitle = {Proceedings of the 34th International Conference on
+               Machine Learning ({ICML})},
+  series    = {Proceedings of Machine Learning Research},
+  volume    = {70},
+  pages     = {1321--1330},
+  publisher = {PMLR},
+  year      = {2017},
+  url       = {https://proceedings.mlr.press/v70/guo17a.html}
+}
+
+@inproceedings{kendall2017uncertainties,
+  author    = {Alex Kendall and Yarin Gal},
+  title     = {What Uncertainties Do We Need in {B}ayesian Deep Learning
+               for Computer Vision?},
+  booktitle = {Advances in Neural Information Processing Systems 30
+               ({NIPS})},
+  pages     = {5574--5584},
+  year      = {2017},
+  url       = {https://proceedings.neurips.cc/paper/2017/hash/2650d6089a6d640c5e85b2b88265dc2b-Abstract.html}
+}
+
+@inproceedings{ovadia2019trust,
+  author    = {Yaniv Ovadia and Emily Fertig and Jie Ren and
+               Zachary Nado and D. Sculley and Sebastian Nowozin and
+               Joshua V. Dillon and Balaji Lakshminarayanan and
+               Jasper Snoek},
+  title     = {Can You Trust Your Model's Uncertainty? Evaluating
+               Predictive Uncertainty Under Dataset Shift},
+  booktitle = {Advances in Neural Information Processing Systems 32
+               ({NeurIPS})},
+  pages     = {13969--13980},
+  year      = {2019},
+  url       = {https://proceedings.neurips.cc/paper/2019/hash/8558cb408c1d76621371888657d2eb1d-Abstract.html}
+}
+
+% ---------------------------------------------------------------------
+%  The network, and the scaffolding it is built on
+% ---------------------------------------------------------------------
+
+@inproceedings{vaswani2017attention,
+  author    = {Ashish Vaswani and Noam Shazeer and Niki Parmar and
+               Jakob Uszkoreit and Llion Jones and Aidan N. Gomez and
+               Lukasz Kaiser and Illia Polosukhin},
+  title     = {Attention is All you Need},
+  booktitle = {Advances in Neural Information Processing Systems 30
+               ({NIPS})},
+  pages     = {5998--6008},
+  year      = {2017},
+  url       = {https://proceedings.neurips.cc/paper/2017/hash/3f5ee243547dee91fbd053c1c4a845aa-Abstract.html}
+}
+
+@techreport{radford2019language,
+  author      = {Alec Radford and Jeffrey Wu and Rewon Child and
+                 David Luan and Dario Amodei and Ilya Sutskever},
+  title       = {Language Models are Unsupervised Multitask Learners},
+  institution = {OpenAI},
+  year        = {2019},
+  url         = {https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf}
+}
+
+@inproceedings{dao2022flashattention,
+  author    = {Tri Dao and Daniel Y. Fu and Stefano Ermon and
+               Atri Rudra and Christopher R{\'{e}}},
+  title     = {{FlashAttention}: Fast and Memory-Efficient Exact
+               Attention with {IO}-Awareness},
+  booktitle = {Advances in Neural Information Processing Systems 35
+               ({NeurIPS})},
+  year      = {2022},
+  url       = {http://papers.nips.cc/paper_files/paper/2022/hash/67d57c32e20fd0a7a302cb81d36e40d5-Abstract-Conference.html}
+}
+
+@misc{karpathy2024llmc,
+  author       = {Andrej Karpathy},
+  title        = {{llm.c}: {LLM} training in simple, raw {C/CUDA}},
+  howpublished = {\url{https://github.com/karpathy/llm.c}},
+  year         = {2024}
+}
+
+@misc{karpathy2022nanogpt,
+  author       = {Andrej Karpathy},
+  title        = {{nanoGPT}},
+  howpublished = {\url{https://github.com/karpathy/nanoGPT}},
+  year         = {2022}
+}
+
+% ---------------------------------------------------------------------
+%  Data and machinery
+% ---------------------------------------------------------------------
+
+@misc{mahoney2011text8,
+  author       = {Matt Mahoney},
+  title        = {About the Test Data},
+  howpublished = {\url{http://mattmahoney.net/dc/textdata.html}},
+  year         = {2011},
+  note         = {Large Text Compression Benchmark; source of
+                  \texttt{enwik8} and \texttt{text8}}
+}
+
+@inproceedings{kingma2015adam,
+  author    = {Diederik P. Kingma and Jimmy Ba},
+  title     = {{A}dam: {A} Method for Stochastic Optimization},
+  booktitle = {3rd International Conference on Learning Representations
+               ({ICLR})},
+  year      = {2015},
+  url       = {http://arxiv.org/abs/1412.6980}
+}
+
+@inproceedings{loshchilov2019adamw,
+  author    = {Ilya Loshchilov and Frank Hutter},
+  title     = {Decoupled Weight Decay Regularization},
+  booktitle = {7th International Conference on Learning Representations
+               ({ICLR})},
+  publisher = {OpenReview.net},
+  year      = {2019},
+  url       = {https://openreview.net/forum?id=Bkg6RiCqY7}
+}
+
+@inproceedings{salmon2011parallel,
+  author    = {John K. Salmon and Mark A. Moraes and Ron O. Dror and
+               David E. Shaw},
+  title     = {Parallel Random Numbers: As Easy as 1, 2, 3},
+  booktitle = {Proceedings of the International Conference for High
+               Performance Computing, Networking, Storage and Analysis
+               ({SC})},
+  pages     = {16:1--16:12},
+  publisher = {{ACM}},
+  year      = {2011},
+  doi       = {10.1145/2063384.2063405}
+}

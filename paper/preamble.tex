@@ -1,0 +1,45 @@
+% =====================================================================
+%  Preamble — deliberately class-agnostic.
+%
+%  Nothing here assumes `article`. A venue swap changes main.tex's
+%  \documentclass line only; if the venue style already loads one of
+%  these packages, delete that single \usepackage line here.
+% =====================================================================
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+\usepackage{booktabs}         % all generated tables use \toprule/\midrule/\bottomrule
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage[numbers]{natbib}  % venue styles often preload natbib; drop this line if so
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, allcolors=blue!55!black}
+
+% `article` has no page geometry worth the name. A venue style does —
+% delete this line when swapping one in.
+\usepackage[margin=1in]{geometry}
+
+% ---------------------------------------------------------------------
+%  Placeholders.
+%
+%  \todo{...}  author-facing note. Loud on purpose.
+%  \NA         a table cell with NO measurement behind it. Emitted by
+%              paper/tables/make_tables.py; never typed by hand.
+%
+%  Both must stay visually impossible to mistake for data. Soften them
+%  here (one place) if a camera-ready needs quiet, never by editing a
+%  generated table.
+% ---------------------------------------------------------------------
+\newcommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
+\newcommand{\NA}{\textcolor{red}{\textsc{todo}}}
+
+% Directory the table generator writes into. Referenced by \input in the
+% results sections; see paper/README.md for how to regenerate.
+\newcommand{\generated}{tables/generated}

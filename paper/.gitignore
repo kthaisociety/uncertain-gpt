@@ -1,0 +1,23 @@
+# The repo root ignores everything and whitelists authored file types
+# (see ../.gitignore). LaTeX sources are let back in HERE rather than by
+# widening that list, since they exist nowhere else.
+!*.tex
+!*.bib
+!*.sty
+!*.cls
+!*.bst
+
+# ...but never the build output, and never the generated tables. Those are
+# rebuilt by `make`; committing one would let a number outlive the
+# measurement it came from.
+tables/generated/
+*.pdf
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz

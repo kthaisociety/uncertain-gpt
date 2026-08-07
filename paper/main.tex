@@ -1,0 +1,47 @@
+% =====================================================================
+%  uncertain-gpt — paper skeleton.
+%
+%  SCAFFOLDING ONLY. Every section file contains guiding comments and no
+%  prose. Every number reaches the PDF through paper/tables/, never by
+%  hand. See paper/README.md.
+%
+%  Venue swap: replace ONLY the \documentclass line below (and add the
+%  venue .sty next to this file). Nothing else in this file is
+%  class-specific; preamble.tex is deliberately class-agnostic.
+% =====================================================================
+\documentclass[11pt]{article}
+
+\input{preamble}
+
+\title{\todo{title}}
+\author{\todo{authors}}
+\date{\todo{date}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+% What the paper measures and on what. One controlled comparison: four
+% posterior approximations, one shared network, one card. State the
+% question, not an answer — the numbers are not in yet.
+\todo{abstract}
+\end{abstract}
+
+\input{sections/introduction}
+\input{sections/related-work}
+\input{sections/methods}
+\input{sections/setup}
+\input{sections/cost-results}
+\input{sections/quality-results}
+\input{sections/discussion}
+\input{sections/limitations}
+
+% The skeleton has no prose, so it has no \cite commands and the
+% bibliography would render empty. \nocite{*} pulls every verified entry
+% in, which is also how you check that references.bib still compiles.
+% DELETE this line once the prose cites for real.
+\nocite{*}
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

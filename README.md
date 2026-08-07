@@ -25,5 +25,8 @@ make test                                       # run every variant, print one t
 
 Built for an RTX 2060 (`sm_75`); override with `make ARCH=sm_XX`.
 
+`paper/` holds the write-up: `make -C paper`. Its tables are generated from
+`runs/`, never typed.
+
 The deterministic scaffolding (`train_gpt2.c`, the data pipeline) follows
 Karpathy's [llm.c](https://github.com/karpathy/llm.c). MIT, same as llm.c.
